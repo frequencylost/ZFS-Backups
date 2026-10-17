@@ -1,0 +1,76 @@
+Menu="Utilities"
+Title="ZFS Backups"
+Type="xmenu"
+Icon="images/zfs.backups.png"
+Tag="zfs.backups"
+Markdown="false"
+---
+<?php $zfsb_csrf = $var['csrf_token'] ?? ''; ?>
+<style>
+.zfsb { --zb-border: rgba(128,128,128,.35); --zb-muted: rgba(128,128,128,.9); --zb-ok: #3c9a3c; --zb-warn: #d18b00; --zb-bad: #d03b3b; --zb-info: #2a7fd4; }
+.zfsb table.zb { width: 100%; border-collapse: collapse; margin: 8px 0 16px; }
+.zfsb table.zb th { text-align: left; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--zb-border); white-space: nowrap; }
+.zfsb table.zb td { padding: 7px 8px; border-bottom: 1px solid var(--zb-border); vertical-align: top; }
+.zfsb .muted { color: var(--zb-muted); font-size: .92em; }
+.zfsb .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: .85em; font-weight: 600; color: #fff; }
+.zfsb .b-success { background: var(--zb-ok); } .zfsb .b-warning { background: var(--zb-warn); }
+.zfsb .b-failed { background: var(--zb-bad); } .zfsb .b-running { background: var(--zb-info); }
+.zfsb .b-never, .zfsb .b-disabled { background: #888; }
+.zfsb .actions { white-space: nowrap; }
+.zfsb .actions button, .zfsb .actions input[type=button] { margin: 0 4px 4px 0; min-width: 0; padding: 4px 10px; }
+.zfsb .panel { border: 1px solid var(--zb-border); border-radius: 4px; padding: 14px 18px; margin: 10px 0 18px; }
+.zfsb .panel h3 { margin: 0 0 10px; font-size: 1.15em; }
+.zfsb .grid { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 10px 16px; align-items: center; }
+.zfsb .grid > label { font-weight: 600; }
+.zfsb .grid .hint { grid-column: 2; margin-top: -6px; }
+.zfsb .ret { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.zfsb .ret label { display: flex; flex-direction: column; font-size: .9em; }
+.zfsb .ret input { width: 70px; }
+.zfsb .dslist { max-height: 340px; overflow: auto; border: 1px solid var(--zb-border); border-radius: 3px; }
+.zfsb .dslist table { width: 100%; border-collapse: collapse; }
+.zfsb .dslist td { padding: 3px 8px; border-bottom: 1px solid rgba(128,128,128,.15); }
+.zfsb .dslist tr.covered td.name { color: var(--zb-muted); }
+.zfsb .dslist tr.excluded td.name { text-decoration: line-through; color: var(--zb-muted); }
+.zfsb .dslist td.cb { width: 64px; text-align: center; }
+.zfsb .dslist thead td { font-weight: 600; position: sticky; top: 0; background: var(--zb-header-bg, rgba(128,128,128,.12)); backdrop-filter: blur(4px); }
+.zfsb .alert { border-left: 4px solid var(--zb-warn); padding: 8px 12px; margin: 8px 0 14px; background: rgba(209,139,0,.08); }
+.zfsb .alert.bad { border-color: var(--zb-bad); background: rgba(208,59,59,.08); }
+.zfsb .alert.good { border-color: var(--zb-ok); background: rgba(60,154,60,.08); }
+.zfsb pre.out { max-height: 420px; overflow: auto; padding: 10px 14px; border: 1px solid var(--zb-border); border-radius: 3px; background: rgba(0,0,0,.08); font-size: 12px; line-height: 1.4; white-space: pre-wrap; }
+.zfsb textarea.log { width: 100%; height: 480px; box-sizing: border-box; font-family: monospace; font-size: 11.5px; line-height: 1.4; padding: 10px 14px; resize: vertical; }
+.zfsb .hidden { display: none !important; }
+@media (max-width: 760px) {
+  .zfsb .grid { grid-template-columns: 1fr; } .zfsb .grid .hint { grid-column: 1; }
+  .zfsb table.zb thead { display: none; } .zfsb table.zb td { display: block; border: 0; padding: 3px 8px; }
+  .zfsb table.zb tr { display: block; border-bottom: 1px solid var(--zb-border); padding: 6px 0; }
+}
+</style>
+<script>
+var ZFSB = {
+  api: '/plugins/zfs.backups/include/api.php',
+  csrf: <?=json_encode($zfsb_csrf)?>,
+  call: function (action, data) {
+    return $.post(ZFSB.api, $.extend({ action: action, csrf_token: ZFSB.csrf }, data || {}), null, 'json');
+  },
+  esc: function (s) { return $('<div>').text(s == null ? '' : String(s)).html(); },
+  ago: function (epoch) {
+    if (!epoch) return '';
+    var s = Math.round(Date.now() / 1000 - epoch);
+    if (s < 60) return 'just now';
+    if (s < 3600) return Math.round(s / 60) + ' min ago';
+    if (s < 86400) return Math.round(s / 3600) + ' h ago';
+    return Math.round(s / 86400) + ' d ago';
+  },
+  size: function (b) {
+    var u = ['B', 'K', 'M', 'G', 'T', 'P'], i = 0;
+    while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+    return (i ? b.toFixed(b < 10 ? 1 : 0) : b) + u[i];
+  },
+  datasets: null,
+  loadDatasets: function () {
+    if (ZFSB.datasets) return $.Deferred().resolve(ZFSB.datasets).promise();
+    return ZFSB.call('datasets').then(function (r) { ZFSB.datasets = r.datasets || []; return ZFSB.datasets; });
+  },
+  errors: function (r) { return (r && (r.errors || [r.error])) || ['Request failed']; }
+};
+</script>

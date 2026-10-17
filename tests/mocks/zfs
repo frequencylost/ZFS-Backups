@@ -1,0 +1,91 @@
+#!/bin/bash
+# Fake `zfs` for tests. State lives in $ZFSMOCK:
+#   datasets   name<TAB>mountpoint<TAB>available-bytes
+#   snapshots  dataset@snap<TAB>creation-epoch
+#   calls.log  every invocation, in order
+set -u
+: "${ZFSMOCK:?ZFSMOCK not set - refusing to run}"
+D="$ZFSMOCK/datasets"; S="$ZFSMOCK/snapshots"
+touch "$D" "$S"
+echo "zfs $*" >> "$ZFSMOCK/calls.log"
+
+[[ -n ${ZFSMOCK_FAIL:-} && "$*" == *"$ZFSMOCK_FAIL"* ]] && { echo "mock failure: $*" >&2; exit 1; }
+
+ds_exists() { awk -F'\t' -v n="$1" '$1==n{f=1} END{exit !f}' "$D"; }
+tree()      { awk -F'\t' -v n="$1" '$1==n || index($1, n"/")==1 {print $1}' "$D"; }
+
+cmd=$1; shift
+# split flags from positional args (flags with values: -o -t -d -s)
+recursive=0 depth="" types="" fields="" positional=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -o) fields=$2; shift 2 ;;
+    -t) types=$2; shift 2 ;;
+    -d) depth=$2; shift 2 ;;
+    -s) shift 2 ;;
+    -*) f=${1#-}
+        [[ $f == *r* ]] && recursive=1
+        [[ $f == *t ]] && { types=$2; shift; }
+        [[ $f == *d ]] && { depth=$2; shift; }
+        shift ;;
+    *) positional+=("$1"); shift ;;
+  esac
+done
+
+case $cmd in
+  list)
+    if [[ $types == snapshot ]]; then
+      t=${positional[0]-}
+      awk -F'\t' -v n="$t" 'n=="" || index($1, n"@")==1 {print $1}' "$S"; exit 0
+    fi
+    [[ ${#positional[@]} -eq 0 ]] && { cut -f1 "$D"; exit 0; }
+    n=${positional[0]}
+    ds_exists "$n" || { echo "cannot open '$n': dataset does not exist" >&2; exit 1; }
+    if [[ $recursive -eq 0 ]]; then echo "$n"; exit 0; fi
+    if [[ $depth == 1 ]]; then
+      tree "$n" | awk -v n="$n" '{rel=substr($0, length(n)+2)} $0==n || rel !~ /\// {print}'
+    else
+      tree "$n"
+    fi ;;
+  get)
+    prop=${positional[0]}
+    if [[ $prop == creation && $types == snapshot ]]; then
+      awk -F'\t' '{printf "%s\tcreation\t%s\t-\n", $1, $2}' "$S"; exit 0
+    fi
+    n=${positional[1]}
+    ds_exists "$n" || { echo "cannot open '$n'" >&2; exit 1; }
+    case $prop in
+      mountpoint) awk -F'\t' -v n="$n" '$1==n{print $2}' "$D" ;;
+      available)  awk -F'\t' -v n="$n" '$1==n{print $3}' "$D" ;;
+      *) echo "-" ;;
+    esac ;;
+  snapshot)
+    full=${positional[0]}; ds=${full%@*}; snap=${full#*@}
+    ds_exists "$ds" || { echo "dataset does not exist" >&2; exit 1; }
+    now=$(date +%s)
+    if [[ $recursive -eq 1 ]]; then
+      tree "$ds" | while read -r c; do printf '%s@%s\t%s\n' "$c" "$snap" "$now" >> "$S"; done
+    else
+      printf '%s@%s\t%s\n' "$ds" "$snap" "$now" >> "$S"
+    fi ;;
+  destroy)
+    n=${positional[0]}
+    if [[ $n == *@* ]]; then
+      awk -F'\t' -v n="$n" '$1==n{f=1} END{exit !f}' "$S" || { echo "could not find snapshot $n" >&2; exit 1; }
+      awk -F'\t' -v n="$n" '$1!=n' "$S" > "$S.tmp" && mv "$S.tmp" "$S"
+    else
+      mp=$(awk -F'\t' -v n="$n" '$1==n{print $2}' "$D")
+      awk -F'\t' -v n="$n" '$1!=n' "$D" > "$D.tmp" && mv "$D.tmp" "$D"
+      [[ -n $mp && -d $mp ]] && rm -rf "$mp"
+    fi ;;
+  create)
+    n=${positional[0]}
+    ds_exists "$n" && { echo "dataset already exists" >&2; exit 1; }
+    parent=${n%/*}
+    pmp=$(awk -F'\t' -v n="$parent" '$1==n{print $2}' "$D")
+    mp="$pmp/${n##*/}"
+    [[ -e $mp ]] && { echo "mountpoint '$mp' exists and is not empty" >&2; exit 1; }
+    mkdir -p "$mp"
+    printf '%s\t%s\t%s\n' "$n" "$mp" "$(awk -F'\t' -v n="$parent" '$1==n{print $3}' "$D")" >> "$D" ;;
+  *) echo "mock zfs: unsupported command $cmd" >&2; exit 1 ;;
+esac

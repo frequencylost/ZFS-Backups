@@ -1,0 +1,380 @@
+Menu="ZFSBackups:1"
+Title="Snapshot Jobs"
+Markdown="false"
+---
+<div class="zfsb" id="zb-jobs">
+  <div id="zb-conflicts" class="alert hidden"></div>
+
+  <p class="muted">Each job snapshots its datasets on its own schedule and keeps its own number of hourly / daily /
+  weekly / monthly / yearly snapshots. Jobs run one at a time. Snapshots use sanoid's <code>autosnap_</code> names, so
+  snapshots made by the Sanoid plugin, SpaceInvader One's scripts or ZFS Buddy Backup are adopted and pruned
+  normally. Snapshots with other names (for example ones made in ZFS Master) are never touched.</p>
+
+  <table class="zb" id="zb-table">
+    <thead><tr><th>Job</th><th>Datasets</th><th>Keep</th><th>Schedule</th><th>Replication</th><th>Last run</th><th></th></tr></thead>
+    <tbody><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
+  </table>
+  <input type="button" value="Add job" id="zb-add">
+
+  <div class="panel hidden" id="zb-output">
+    <h3 id="zb-output-title">Preview</h3>
+    <pre class="out" id="zb-output-text"></pre>
+    <input type="button" value="Close" onclick="$('#zb-output').addClass('hidden')">
+  </div>
+
+  <!-- ------------------------------------------------------------ editor -->
+  <form class="panel hidden" id="zb-editor" onsubmit="return false">
+    <h3 id="zb-editor-title">New job</h3>
+    <input type="hidden" name="id">
+    <div class="grid">
+      <label>Name</label>
+      <input type="text" name="NAME" maxlength="48" placeholder="e.g. Appdata" required>
+
+      <label>Enabled</label>
+      <select name="ENABLED"><option value="yes">Yes</option><option value="no">No (manual runs only)</option></select>
+
+      <label>Child datasets</label>
+      <select name="RECURSIVE">
+        <option value="yes">Include them, one by one (recommended — new ones are picked up automatically, children can be excluded)</option>
+        <option value="zfs">Include them atomically (zfs snapshot -r — one consistent point in time, no excludes)</option>
+        <option value="no">Only the selected datasets themselves</option>
+      </select>
+
+      <label>Datasets</label>
+      <div>
+        <input type="text" id="zb-ds-filter" placeholder="Filter datasets…" style="width: 260px">
+        <label style="font-weight: normal; margin-left: 10px"><input type="checkbox" id="zb-ds-selected"> show selected only</label>
+        <div class="dslist" style="margin-top: 6px">
+          <table><thead><tr><td>Dataset</td><td class="cb">Include</td><td class="cb">Exclude</td><td style="text-align:right">Used</td></tr></thead>
+          <tbody id="zb-ds"></tbody></table>
+        </div>
+      </div>
+
+      <label>Keep</label>
+      <div>
+        <div class="ret">
+          <label>Hourly <input type="number" min="0" max="9999" name="HOURLY"></label>
+          <label>Daily <input type="number" min="0" max="9999" name="DAILY"></label>
+          <label>Weekly <input type="number" min="0" max="9999" name="WEEKLY"></label>
+          <label>Monthly <input type="number" min="0" max="9999" name="MONTHLY"></label>
+          <label>Yearly <input type="number" min="0" max="9999" name="YEARLY"></label>
+        </div>
+        <div class="muted" style="margin-top: 6px">Presets:
+          <a href="#" data-preset="0,7,4,3,0">Appdata — 7 daily, 4 weekly, 3 monthly</a> ·
+          <a href="#" data-preset="0,2,0,0,0">Media — 2 daily</a> ·
+          <a href="#" data-preset="0,1,0,0,0">Media — 1 daily</a> ·
+          <a href="#" data-preset="24,7,4,6,0">Frequent — 24 hourly, 7d, 4w, 6m</a>
+        </div>
+      </div>
+      <div class="hint muted">Sanoid only deletes a snapshot when it is older than the window <em>and</em> you have more
+        than that many of its kind, so a missed night never costs you history.</div>
+
+      <label>Schedule</label>
+      <div>
+        <select name="SCHEDULE">
+          <option value="daily">Daily</option><option value="weekly">Weekly</option>
+          <option value="hourly">Hourly</option><option value="custom">Custom (cron)</option>
+          <option value="disabled">Manual only</option>
+        </select>
+        <select name="SCHEDULE_DOW" class="zb-dow">
+          <option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option>
+          <option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option>
+        </select>
+        <span class="zb-time"><span class="zb-at">at</span> <input type="time" name="SCHEDULE_TIME" style="width: 110px"></span>
+        <input type="text" name="SCHEDULE_CRON" class="zb-cron" placeholder="m h dom mon dow, e.g. 30 1 * * *" style="width: 220px">
+      </div>
+      <div class="hint muted" id="zb-hourly-hint"></div>
+
+      <label>Wake array disks</label>
+      <select name="WAKE_DISKS">
+        <option value="yes">Yes — spin up the array disks this job uses, all at once, before snapshotting</option>
+        <option value="no">No — let ZFS wake each disk when it gets to it</option>
+      </select>
+
+      <label>Replication</label>
+      <select name="REPL_METHOD">
+        <option value="none">None — snapshots only</option>
+        <option value="zfs">ZFS send (syncoid) to another pool or server</option>
+        <option value="rsync">rsync to a folder (for non-ZFS targets)</option>
+      </select>
+
+      <label class="zb-repl">Destination server</label>
+      <div class="zb-repl">
+        <input type="text" name="REPL_HOST" placeholder="leave empty for this server" style="width: 200px">
+        user <input type="text" name="REPL_USER" style="width: 80px">
+        port <input type="number" name="REPL_PORT" min="1" max="65535" style="width: 80px">
+        key <input type="text" name="REPL_SSH_KEY" placeholder="default (~/.ssh/id_*)" style="width: 200px">
+      </div>
+      <div class="hint muted zb-repl">Remote servers need key-based SSH from this server as root (no password prompts).</div>
+
+      <label class="zb-repl">Destination</label>
+      <div class="zb-repl">
+        <input type="text" name="REPL_TARGET" style="width: 320px">
+        <div class="muted zb-repl-zfs">Parent dataset, e.g. <code>disk6/BACKUPS/zfs</code>. Each source lands in a child named
+          after it (<code>supercache/appdata</code> → <code>…/supercache_appdata</code>). Created if missing.</div>
+        <div class="muted zb-repl-rsync">Folder, e.g. <code>/mnt/disk6/BACKUPS/rsync</code>. Copied from a temporary snapshot, so files are consistent.</div>
+      </div>
+
+      <label class="zb-repl zb-repl-zfs">Destination snapshots</label>
+      <select name="REPL_ZFS_MODE" class="zb-repl zb-repl-zfs">
+        <option value="strict-mirror">Mirror the source (delete destination snapshots the source no longer has)</option>
+        <option value="basic">Keep everything ever sent (destination grows over time)</option>
+      </select>
+
+      <label class="zb-repl zb-repl-rsync">rsync mode</label>
+      <div class="zb-repl zb-repl-rsync">
+        <select name="REPL_RSYNC_MODE">
+          <option value="incremental">Dated copies (unchanged files are hard-linked, so each copy is cheap)</option>
+          <option value="mirror">Single mirror (destination matches the source)</option>
+        </select>
+        keep newest <input type="number" name="REPL_RSYNC_KEEP" min="0" max="9999" style="width: 70px"> copies <span class="muted">(0 = keep all)</span>
+      </div>
+
+      <label>Notifications</label>
+      <select name="NOTIFY">
+        <option value="all">Success and failure</option><option value="error">Failures and warnings only</option><option value="none">None</option>
+      </select>
+
+      <span></span>
+      <div>
+        <div id="zb-editor-errors" class="alert bad hidden"></div>
+        <input type="button" value="Save" id="zb-save"> <input type="button" value="Cancel" id="zb-cancel">
+      </div>
+    </div>
+  </form>
+</div>
+
+<script>
+(function () {
+  var jobs = [], timer = null;
+  var DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  var DEFAULTS = { NAME: '', ENABLED: 'yes', RECURSIVE: 'yes', DATASETS: '', EXCLUDE: '', HOURLY: 0, DAILY: 7, WEEKLY: 4,
+    MONTHLY: 3, YEARLY: 0, SCHEDULE: 'daily', SCHEDULE_TIME: '00:30', SCHEDULE_DOW: '0', SCHEDULE_CRON: '', WAKE_DISKS: 'yes',
+    REPL_METHOD: 'none', REPL_HOST: '', REPL_USER: 'root', REPL_PORT: 22, REPL_SSH_KEY: '', REPL_TARGET: '',
+    REPL_ZFS_MODE: 'strict-mirror', REPL_RSYNC_MODE: 'incremental', REPL_RSYNC_KEEP: 14, NOTIFY: 'all' };
+
+  // ------------------------------------------------------------- job table
+  function schedText(c) {
+    switch (c.SCHEDULE) {
+      case 'daily': return 'Daily ' + (c.SCHEDULE_TIME || '');
+      case 'weekly': return DOW[+c.SCHEDULE_DOW || 0] + ' ' + (c.SCHEDULE_TIME || '');
+      case 'hourly': return 'Hourly at :' + (c.SCHEDULE_TIME || '00:00').split(':')[1];
+      case 'custom': return '<code>' + ZFSB.esc(c.SCHEDULE_CRON) + '</code>';
+      default: return '<span class="muted">Manual</span>';
+    }
+  }
+  function keepText(c) {
+    var parts = [], map = [['HOURLY', 'h'], ['DAILY', 'd'], ['WEEKLY', 'w'], ['MONTHLY', 'm'], ['YEARLY', 'y']];
+    map.forEach(function (m) { if (+c[m[0]] > 0) parts.push(c[m[0]] + m[1]); });
+    return parts.join(' ') || '—';
+  }
+  function dsText(c) {
+    var ds = (c.DATASETS || '').split(' ').filter(Boolean);
+    var shown = ds.slice(0, 3).map(function (d) { return '<code>' + ZFSB.esc(d) + '</code>'; }).join('<br>');
+    if (ds.length > 3) shown += '<br><span class="muted">+' + (ds.length - 3) + ' more</span>';
+    var rec = { yes: '+ children', zfs: '+ children (atomic)', no: '' }[c.RECURSIVE || 'yes'];
+    var ex = (c.EXCLUDE || '').split(' ').filter(Boolean).length;
+    return shown + (rec ? '<br><span class="muted">' + rec + (ex ? ', ' + ex + ' excluded' : '') + '</span>' : '');
+  }
+  function replText(c) {
+    if (!c.REPL_METHOD || c.REPL_METHOD === 'none') return '<span class="muted">—</span>';
+    var where = (c.REPL_HOST ? (c.REPL_USER || 'root') + '@' + c.REPL_HOST + ':' : '') + c.REPL_TARGET;
+    return c.REPL_METHOD + ' → <code>' + ZFSB.esc(where) + '</code>';
+  }
+  function statusHtml(j) {
+    if (j.running) return '<span class="badge b-running">running</span>';
+    var s = j.status;
+    if (!s) return '<span class="badge b-never">never run</span>';
+    var html = '<span class="badge b-' + ZFSB.esc(s.state) + '">' + ZFSB.esc(s.state) + '</span> ' +
+      '<span class="muted">' + ZFSB.ago(s.finished) + (s.dry_run ? ' · dry run' : '') + '</span>';
+    return html + '<br><span class="muted">' + ZFSB.esc(s.summary) + '</span>';
+  }
+
+  function render() {
+    var $tb = $('#zb-table tbody').empty();
+    if (!jobs.length) {
+      $tb.append('<tr><td colspan="7" class="muted">No jobs yet. Click <b>Add job</b> to create one, ' +
+        'for example one for appdata (long retention) and one for media (a day or two).</td></tr>');
+      return;
+    }
+    jobs.forEach(function (j) {
+      var c = j.cfg, off = c.ENABLED === 'no';
+      var $tr = $('<tr>').append(
+        $('<td>').html('<b>' + ZFSB.esc(c.NAME || j.id) + '</b>' + (off ? '<br><span class="badge b-disabled">disabled</span>' : '')),
+        $('<td>').html(dsText(c)),
+        $('<td>').html(keepText(c)),
+        $('<td>').html(off ? '<span class="muted">—</span>' : schedText(c)),
+        $('<td>').html(replText(c)),
+        $('<td>').html(statusHtml(j)),
+        $('<td class="actions">')
+      );
+      var $a = $tr.find('.actions');
+      $('<input type="button" value="Run now">').prop('disabled', j.running).on('click', function () { run(j, false); }).appendTo($a);
+      $('<input type="button" value="Dry run">').prop('disabled', j.running).on('click', function () { run(j, true); }).appendTo($a);
+      $('<input type="button" value="Preview">').on('click', function () { plan(j); }).appendTo($a);
+      $('<input type="button" value="Log">').on('click', function () { if (window.ZFSBLogs) ZFSBLogs.show(j.id, true); }).appendTo($a);
+      $('<input type="button" value="Edit">').on('click', function () { edit(j); }).appendTo($a);
+      $('<input type="button" value="Delete">').prop('disabled', j.running).on('click', function () { del(j); }).appendTo($a);
+      $tb.append($tr);
+    });
+  }
+
+  function refresh() {
+    clearTimeout(timer);
+    return ZFSB.call('jobs').done(function (r) {
+      jobs = r.jobs || [];
+      render();
+      var busy = jobs.some(function (j) { return j.running; });
+      timer = setTimeout(refresh, busy ? 3000 : 20000);
+    });
+  }
+
+  function checkConflicts() {
+    ZFSB.call('conflicts').done(function (r) {
+      var t = (r.text || '').trim();
+      if (!t || /^No conflicts/.test(t)) { $('#zb-conflicts').addClass('hidden'); return; }
+      $('#zb-conflicts').removeClass('hidden').html(
+        '<b>Other tools are also managing these datasets.</b> Two tools pruning the same <code>autosnap_</code> ' +
+        'snapshots with different rules will fight each other. Once your jobs here are set up, turn the other ones off ' +
+        '(remove the datasets from ZFS Buddy Backup / the Sanoid plugin, and disable the old User Scripts).' +
+        '<pre class="out" style="margin-top:8px">' + ZFSB.esc(t) + '</pre>');
+    });
+  }
+
+  function run(j, dry) {
+    var what = dry ? 'Simulate' : 'Run';
+    if (!confirm(what + ' job "' + (j.cfg.NAME || j.id) + '" now?' + (dry ? '\n\nNothing will be changed.' : ''))) return;
+    ZFSB.call('run_job', { id: j.id, dry: dry ? 'yes' : 'no' }).done(function () {
+      setTimeout(refresh, 800);
+      if (window.ZFSBLogs) ZFSBLogs.show(j.id, true);
+    });
+  }
+
+  function plan(j) {
+    $('#zb-output-title').text('Preview: ' + (j.cfg.NAME || j.id) + ' (nothing is changed)');
+    $('#zb-output-text').text('Working…');
+    $('#zb-output').removeClass('hidden')[0].scrollIntoView({ behavior: 'smooth' });
+    ZFSB.call('plan_job', { id: j.id }).done(function (r) { $('#zb-output-text').text(r.text || ''); })
+      .fail(function () { $('#zb-output-text').text('Preview failed.'); });
+  }
+
+  function del(j) {
+    if (!confirm('Delete job "' + (j.cfg.NAME || j.id) + '"?\n\nIts schedule is removed. Existing snapshots are kept ' +
+      '(they will no longer be pruned unless another job covers those datasets).')) return;
+    ZFSB.call('delete_job', { id: j.id }).done(refresh);
+  }
+
+  // ------------------------------------------------------------- editor
+  var include = {}, exclude = {};
+
+  function covered(name) {   // is this dataset covered by an included ancestor (with recursion)?
+    if ($('[name=RECURSIVE]').val() === 'no') return false;
+    var p = name;
+    while (p.indexOf('/') > 0) { p = p.slice(0, p.lastIndexOf('/')); if (include[p]) return p; }
+    return false;
+  }
+
+  function renderDatasets() {
+    var filter = $('#zb-ds-filter').val().toLowerCase(), onlySel = $('#zb-ds-selected').prop('checked');
+    var rec = $('[name=RECURSIVE]').val();
+    var $tb = $('#zb-ds').empty();
+    (ZFSB.datasets || []).forEach(function (d) {
+      var n = d.name, depth = n.split('/').length - 1, cov = covered(n), inc = !!include[n], exc = !!exclude[n];
+      var excluded = exc || Object.keys(exclude).some(function (e) { return n.indexOf(e + '/') === 0; });
+      if (filter && n.toLowerCase().indexOf(filter) < 0) return;
+      if (onlySel && !inc && !cov) return;
+      var tag = /^disk\d+$/.test(n.split('/')[0]) && depth === 0 ? ' <span class="muted">(array disk)</span>' : '';
+      var $tr = $('<tr>').toggleClass('covered', !!cov && !excluded).toggleClass('excluded', !!cov && excluded);
+      $('<td class="name">').css('padding-left', 8 + depth * 18).html(ZFSB.esc(n.split('/').pop()) + tag)
+        .attr('title', d.valid ? n : n + ' — name has spaces or special characters; sanoid cannot snapshot it').appendTo($tr);
+      var $inc = $('<input type="checkbox">').prop('checked', inc || (!!cov && !excluded)).prop('disabled', !d.valid || (!!cov && !inc))
+        .on('change', function () { if (this.checked) include[n] = 1; else delete include[n]; renderDatasets(); });
+      var $exc = $('<input type="checkbox">').prop('checked', exc).prop('disabled', !cov || rec !== 'yes' || inc)
+        .attr('title', rec === 'zfs' ? 'Excludes need "one by one" child mode' : '')
+        .on('change', function () { if (this.checked) exclude[n] = 1; else delete exclude[n]; renderDatasets(); });
+      $('<td class="cb">').append($inc).appendTo($tr);
+      $('<td class="cb">').append(cov ? $exc : '').appendTo($tr);
+      $('<td class="muted" style="text-align:right">').text(ZFSB.size(d.used)).appendTo($tr);
+      $tb.append($tr);
+    });
+  }
+
+  function syncVisibility() {
+    var s = $('[name=SCHEDULE]').val(), m = $('[name=REPL_METHOD]').val();
+    $('.zb-dow').toggle(s === 'weekly');
+    $('.zb-time').toggle(s === 'daily' || s === 'weekly' || s === 'hourly');
+    $('.zb-at').text(s === 'hourly' ? 'at minute of' : 'at');
+    $('.zb-cron').toggle(s === 'custom');
+    $('.zb-repl').toggleClass('hidden', m === 'none');
+    $('.zb-repl-zfs').toggleClass('hidden', m !== 'zfs');
+    $('.zb-repl-rsync').toggleClass('hidden', m !== 'rsync');
+    var hourly = +$('[name=HOURLY]').val();
+    $('#zb-hourly-hint').text(hourly > 0 && s !== 'hourly'
+      ? 'Hourly snapshots are only taken when the job runs, so with this schedule you get at most one per run.' : '');
+  }
+
+  function edit(j) {
+    var c = $.extend({}, DEFAULTS, j ? j.cfg : {});
+    var $f = $('#zb-editor');
+    $('#zb-editor-title').text(j ? 'Edit job: ' + (c.NAME || j.id) : 'New job');
+    $f.find('[name=id]').val(j ? j.id : '');
+    Object.keys(DEFAULTS).forEach(function (k) { $f.find('[name=' + k + ']').val(c[k]); });
+    include = {}; exclude = {};
+    c.DATASETS.split(' ').filter(Boolean).forEach(function (d) { include[d] = 1; });
+    c.EXCLUDE.split(' ').filter(Boolean).forEach(function (d) { exclude[d] = 1; });
+    $('#zb-editor-errors').addClass('hidden');
+    $('#zb-ds-filter').val(''); $('#zb-ds-selected').prop('checked', !!j);
+    $('#zb-ds').html('<tr><td class="muted">Loading datasets…</td></tr>');
+    $f.removeClass('hidden')[0].scrollIntoView({ behavior: 'smooth' });
+    syncVisibility();
+    ZFSB.loadDatasets().done(renderDatasets);
+  }
+
+  function collect() {
+    var $f = $('#zb-editor'), cfg = {};
+    Object.keys(DEFAULTS).forEach(function (k) { var $e = $f.find('[name=' + k + ']'); if ($e.length) cfg[k] = $e.val(); });
+    var rec = cfg.RECURSIVE;
+    // drop datasets already covered by an included parent; keep excludes only where they still apply
+    cfg.DATASETS = Object.keys(include).filter(function (d) { return !covered(d); }).sort().join(' ');
+    cfg.EXCLUDE = rec === 'yes' ? Object.keys(exclude).filter(function (d) { return covered(d) && !include[d]; }).sort().join(' ') : '';
+    return cfg;
+  }
+
+  function save() {
+    var id = $('#zb-editor [name=id]').val();
+    $('#zb-save').prop('disabled', true);
+    ZFSB.call('save_job', { id: id, cfg: collect() }).done(function (r) {
+      if (!r.ok) {
+        $('#zb-editor-errors').removeClass('hidden').html(ZFSB.errors(r).map(ZFSB.esc).join('<br>'));
+        return;
+      }
+      $('#zb-editor').addClass('hidden');
+      var mine = (r.validate || '').split('\n'), problems = [], on = false;
+      mine.forEach(function (l) { if (l === r.id + ':') on = true; else if (/^\S/.test(l)) on = false; else if (on) problems.push(l.trim()); });
+      if (problems.length) {
+        $('#zb-output-title').text('Saved, but the job will not run until this is fixed');
+        $('#zb-output-text').text(problems.join('\n'));
+        $('#zb-output').removeClass('hidden');
+      }
+      refresh(); checkConflicts();
+    }).always(function () { $('#zb-save').prop('disabled', false); });
+  }
+
+  $(function () {
+    $('#zb-add').on('click', function () { edit(null); });
+    $('#zb-cancel').on('click', function () { $('#zb-editor').addClass('hidden'); });
+    $('#zb-save').on('click', save);
+    $('#zb-ds-filter').on('input', renderDatasets);
+    $('#zb-ds-selected').on('change', renderDatasets);
+    $('[name=RECURSIVE]').on('change', renderDatasets);
+    $('#zb-editor').on('change input', 'select, [name=HOURLY]', syncVisibility);
+    $('#zb-editor').on('click', '[data-preset]', function (e) {
+      e.preventDefault();
+      var v = $(this).data('preset').split(',');
+      ['HOURLY', 'DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'].forEach(function (k, i) { $('#zb-editor [name=' + k + ']').val(v[i]); });
+      syncVisibility();
+    });
+    refresh(); checkConflicts();
+  });
+})();
+</script>

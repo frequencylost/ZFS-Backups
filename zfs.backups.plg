@@ -1,0 +1,97 @@
+<?xml version='1.0' standalone='yes'?>
+
+<!DOCTYPE PLUGIN [
+  <!ENTITY name      "zfs.backups">
+  <!ENTITY author    "FrequencyLost">
+  <!ENTITY version   "2026.10.17">
+  <!ENTITY launch    "Settings/ZFSBackups">
+  <!ENTITY gitURL    "https://raw.githubusercontent.com/frequencylost/ZFS-Backups/main">
+  <!ENTITY pluginURL "&gitURL;/&name;.plg">
+  <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
+  <!ENTITY pkgPath   "/boot/config/plugins/&name;">
+  <!ENTITY pkgName   "&name;-&version;-noarch-1.txz">
+  <!ENTITY pkgMD5    "99f11a4e84f2db3d53b7df1908aee4b9">
+]>
+
+<PLUGIN name="&name;"
+        author="&author;"
+        version="&version;"
+        pluginURL="&pluginURL;"
+        launch="&launch;"
+        support="https://github.com/frequencylost/ZFS-Backups/issues"
+        icon="clone"
+        min="6.12.0">
+
+<CHANGES>
+##ZFS Backups
+
+###2026.10.17
+- Initial release: per-job snapshot retention (sanoid), ZFS/rsync replication, folder to dataset conversion, array disk wake-up
+</CHANGES>
+
+<!-- Perl modules sanoid/syncoid need. Skipped when another plugin already provides them. -->
+<FILE Run="/bin/bash">
+<INLINE>
+if perl -MConfig::IniFiles -MCapture::Tiny -MList::MoreUtils -MExporter::Tiny -e1 2>/dev/null; then
+  echo "Perl modules for sanoid are already installed."
+  exit 0
+fi
+mkdir -p &pkgPath;/deps
+# md5:package  (no heredocs here - a bare less-than sign is not allowed in plugin XML)
+for entry in \
+  e7f985e1f74fab5beb47bdda3354433f:perl-Capture-Tiny-0.48-x86_64-1ponce.txz \
+  b5fccbfb1aea639f8a2e4dfa72a3ffec:perl-Config-IniFiles-2.82-x86_64-3_slonly.txz \
+  7fe323ea307e2bcd560f3487c79b879c:perl-Exporter-Tiny-1.000000-x86_64-1ponce.txz \
+  451c39bb35cbc39bfcbc56412610a843:perl-List-MoreUtils-0.425-x86_64-2_slonly.txz; do
+  md5=${entry%%:*}; pkg=${entry#*:}; f="&pkgPath;/deps/$pkg"
+  if [ ! -f "$f" ]; then
+    echo "Downloading $pkg ..."
+    if ! curl -fsSL --retry 3 -o "$f" "&gitURL;/deps/$pkg"; then rm -f "$f"; echo "Download of $pkg failed."; exit 1; fi
+  fi
+  if [ "$(md5sum "$f" | cut -d' ' -f1)" != "$md5" ]; then rm -f "$f"; echo "Checksum mismatch for $pkg - aborting."; exit 1; fi
+  installpkg "$f" | grep -E "^(Installing|Package)" || true
+done
+</INLINE>
+</FILE>
+
+<!-- The plugin itself -->
+<FILE Name="&pkgPath;/&pkgName;" Run="upgradepkg --install-new --reinstall">
+<URL>&gitURL;/packages/&pkgName;</URL>
+<MD5>&pkgMD5;</MD5>
+</FILE>
+
+<!-- Post-install -->
+<FILE Run="/bin/bash">
+<INLINE>
+chmod 755 &emhttp;/scripts/zfsb &emhttp;/vendor/sanoid &emhttp;/vendor/syncoid
+ln -sf &emhttp;/scripts/zfsb /usr/local/sbin/zfsb
+mkdir -p &pkgPath;/jobs /var/log/&name; /var/local/&name;
+# drop package files from older versions cached on the flash drive
+find &pkgPath; -maxdepth 1 -name '&name;-*.txz' ! -name '&pkgName;' -delete
+/usr/local/sbin/zfsb cron > /dev/null
+echo ""
+echo "----------------------------------------------------------------"
+echo " ZFS Backups &version; is installed."
+echo " Open Settings > ZFS Backups to create your snapshot jobs."
+echo "----------------------------------------------------------------"
+echo ""
+</INLINE>
+</FILE>
+
+<!-- Uninstall: removes the plugin and its schedules. Job settings on the flash drive and all snapshots are kept. -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+rm -f &pkgPath;/&name;.cron
+/usr/local/sbin/update_cron
+removepkg &pkgPath;/&pkgName; > /dev/null
+rm -f /usr/local/sbin/zfsb
+rm -rf &emhttp; /var/local/&name;
+rm -f &pkgPath;/*.txz
+echo ""
+echo " ZFS Backups has been removed. Your snapshots are untouched."
+echo " Job settings are kept in &pkgPath;/jobs (delete that folder to forget them)."
+echo ""
+</INLINE>
+</FILE>
+
+</PLUGIN>

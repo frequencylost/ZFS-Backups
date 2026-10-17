@@ -1,0 +1,2 @@
+#!/bin/bash
+: "${ZFSMOCK:?}"; echo "update_cron" >> "$ZFSMOCK/calls.log"

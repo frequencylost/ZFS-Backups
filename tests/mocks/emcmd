@@ -1,0 +1,5 @@
+#!/bin/bash
+# Fake Unraid emcmd: cmdSpinup=diskN marks the disk spun up in the fake disks.ini
+: "${ZFSMOCK:?}"; echo "emcmd $*" >> "$ZFSMOCK/calls.log"
+d=${1#cmdSpinup=}
+awk -v d="[\"$d\"]" '$0==d{s=1} /^\[/ && $0!=d{s=0} s && /^spundown=/{$0="spundown=\"0\""} 1' "$ZFSMOCK/disks.ini" > "$ZFSMOCK/disks.ini.tmp" && mv "$ZFSMOCK/disks.ini.tmp" "$ZFSMOCK/disks.ini"

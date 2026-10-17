@@ -1,0 +1,884 @@
+#!/bin/bash
+# =============================================================================
+#  zfsb - ZFS Backups engine for Unraid
+#
+#  One tool for: scheduled ZFS snapshots with per-job retention (via sanoid),
+#  optional replication (zfs via syncoid, or rsync), auto-converting folders
+#  to child datasets, and waking array disks before a run.
+#
+#  Usage:
+#    zfsb run <job> [--dry-run] [--cron]   run one job
+#    zfsb run-all [--dry-run]              run every enabled job, in name order
+#    zfsb convert [--dry-run]              run the folder -> dataset converter
+#    zfsb plan <job>                       show what a run would do (no changes)
+#    zfsb validate                         check all jobs, print problems
+#    zfsb conflicts                        list other tools managing the same datasets
+#    zfsb cron                             rewrite the cron file from job configs
+#    zfsb status                           print last-run status of every job (JSON)
+# =============================================================================
+set -o pipefail
+shopt -s nullglob
+
+PLUGIN="zfs.backups"
+CFG_DIR="${ZFSB_CFG_DIR:-/boot/config/plugins/$PLUGIN}"
+JOBS_DIR="$CFG_DIR/jobs"
+CONVERT_CFG="$CFG_DIR/convert.cfg"
+STATE_DIR="${ZFSB_STATE_DIR:-/var/local/$PLUGIN}"
+LOG_DIR="${ZFSB_LOG_DIR:-/var/log/$PLUGIN}"
+EMHTTP="${ZFSB_EMHTTP:-/usr/local/emhttp/plugins/$PLUGIN}"
+SANOID="${ZFSB_SANOID:-$EMHTTP/vendor/sanoid}"
+SYNCOID="${ZFSB_SYNCOID:-$EMHTTP/vendor/syncoid}"
+SANOID_DEFAULTS="${ZFSB_SANOID_DEFAULTS:-$EMHTTP/vendor/sanoid.defaults.conf}"
+NOTIFY_BIN="${ZFSB_NOTIFY:-/usr/local/emhttp/webGui/scripts/notify}"
+EMCMD="${ZFSB_EMCMD:-/usr/local/sbin/emcmd}"
+DISKS_INI="${ZFSB_DISKS_INI:-/var/local/emhttp/disks.ini}"
+UPDATE_CRON="${ZFSB_UPDATE_CRON:-/usr/local/sbin/update_cron}"
+LOCK_FILE="${ZFSB_LOCK:-/var/lock/$PLUGIN.lock}"
+MNT="${ZFSB_MNT:-/mnt}"
+SPINUP_TIMEOUT="${ZFSB_SPINUP_TIMEOUT:-90}"
+
+RSYNC_SNAP="zfsb_rsync_tmp"
+CONVERT_SUFFIX="_zfsb_tmp"
+
+# -----------------------------------------------------------------------------
+# helpers
+# -----------------------------------------------------------------------------
+ts()   { date '+%Y-%m-%d %H:%M:%S'; }
+log()  { echo "[$(ts)] $*"; }
+warn() { echo "[$(ts)] WARNING: $*"; WARNINGS+=("$*"); }
+err()  { echo "[$(ts)] ERROR: $*"; ERRORS+=("$*"); }
+die()  { echo "ERROR: $*" >&2; exit 1; }
+
+declare -a WARNINGS=() ERRORS=()
+
+# Strict KEY="value" reader. Never `source`s config, so values can't run code.
+# Usage: load_cfg <file> <assoc-array-name>
+load_cfg() {
+  local file="$1" line k v
+  local -n _out="$2"
+  _out=()
+  [[ -f $file ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ $line =~ ^[[:space:]]*([A-Z][A-Z0-9_]*)=(.*)$ ]] || continue
+    k=${BASH_REMATCH[1]}; v=${BASH_REMATCH[2]}
+    [[ $v =~ ^\"(.*)\"$ ]] && v=${BASH_REMATCH[1]}
+    _out[$k]=$v
+  done < "$file"
+}
+
+# get a value from the loaded job (J) with a default
+jget() { local v="${J[$1]-}"; [[ -n $v ]] && echo "$v" || echo "${2-}"; }
+
+is_uint() { [[ $1 =~ ^[0-9]+$ ]]; }
+
+# ZFS dataset name we accept: no spaces (sanoid can't parse them), standard ZFS chars
+valid_dataset() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.:/-]*$ && $1 != */ && $1 != *//* ]]; }
+
+dataset_exists() { zfs list -H -o name "$1" >/dev/null 2>&1; }
+
+# all datasets (filesystems + volumes) at and below $1
+dataset_tree() { zfs list -H -r -o name -t filesystem,volume "$1" 2>/dev/null; }
+
+pool_of() { echo "${1%%/*}"; }
+
+notify() { # <normal|warning|alert> <subject> <description>
+  local level="$1" subject="$2" desc="$3" mode="${NOTIFY_MODE:-all}"
+  [[ $mode == none ]] && return 0
+  [[ $mode == error && $level == normal ]] && return 0
+  [[ -x $NOTIFY_BIN ]] || return 0
+  "$NOTIFY_BIN" -e "ZFS Backups" -s "$subject" -d "$desc" -i "$level" >/dev/null 2>&1 || true
+}
+
+job_ids() {
+  local f
+  for f in "$JOBS_DIR"/*.cfg; do f=${f##*/}; echo "${f%.cfg}"; done | sort
+}
+
+valid_job_id() { [[ $1 =~ ^[a-z0-9][a-z0-9_-]{0,47}$ ]]; }
+
+acquire_lock() {
+  mkdir -p "${LOCK_FILE%/*}"
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    log "Another ZFS Backups run is in progress - waiting for it to finish..."
+    flock 9 || die "could not acquire lock $LOCK_FILE"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# job loading / validation
+# -----------------------------------------------------------------------------
+declare -A J
+
+load_job() {
+  local id="$1"
+  valid_job_id "$id" || die "invalid job id '$id'"
+  load_cfg "$JOBS_DIR/$id.cfg" J || die "job '$id' not found ($JOBS_DIR/$id.cfg)"
+  JOB_ID="$id"
+  JOB_NAME=$(jget NAME "$id")
+  read -r -a JOB_DATASETS <<< "$(jget DATASETS)"
+  read -r -a JOB_EXCLUDES <<< "$(jget EXCLUDE)"
+  JOB_RECURSIVE=$(jget RECURSIVE yes)
+  NOTIFY_MODE=$(jget NOTIFY all)
+}
+
+# Validate the currently loaded job. Prints problems; returns 1 if any are fatal.
+validate_job() {
+  local ok=0 ds k
+  [[ ${#JOB_DATASETS[@]} -gt 0 ]] || { echo "no datasets selected"; ok=1; }
+  for ds in "${JOB_DATASETS[@]}"; do
+    if ! valid_dataset "$ds"; then
+      echo "dataset '$ds' has an invalid name (sanoid can't handle spaces or special characters)"; ok=1
+    elif ! dataset_exists "$ds"; then
+      echo "dataset '$ds' does not exist"; ok=1
+    fi
+  done
+  for k in HOURLY DAILY WEEKLY MONTHLY YEARLY; do
+    is_uint "$(jget $k 0)" || { echo "retention $k must be a whole number"; ok=1; }
+  done
+  case $JOB_RECURSIVE in yes|zfs|no) ;; *) echo "RECURSIVE must be yes, zfs or no"; ok=1;; esac
+  if [[ $JOB_RECURSIVE == zfs && ${#JOB_EXCLUDES[@]} -gt 0 ]]; then
+    echo "excludes are not possible with atomic (zfs) recursion - use 'yes' instead"; ok=1
+  fi
+  local total=0
+  for k in HOURLY DAILY WEEKLY MONTHLY YEARLY; do total=$(( total + $(jget $k 0) )); done
+  [[ $total -gt 0 ]] || { echo "retention keeps nothing (all values are 0)"; ok=1; }
+  case $(jget REPL_METHOD none) in
+    none) ;;
+    zfs)
+      valid_dataset "$(jget REPL_TARGET)" || { echo "replication target must be a dataset name like pool/backups"; ok=1; } ;;
+    rsync)
+      [[ $(jget REPL_TARGET) == /* ]] || { echo "rsync target must be an absolute folder path"; ok=1; } ;;
+    *) echo "unknown replication method"; ok=1 ;;
+  esac
+  return $ok
+}
+
+# Expanded list of datasets the loaded job manages (respecting excludes).
+# For atomic zfs recursion every descendant is included (they all get snapshots).
+expand_job_datasets() {
+  local ds child ex skip
+  for ds in "${JOB_DATASETS[@]}"; do
+    if [[ $JOB_RECURSIVE == no ]]; then
+      echo "$ds"; continue
+    fi
+    while IFS= read -r child; do
+      skip=0
+      for ex in "${JOB_EXCLUDES[@]}"; do
+        [[ $child == "$ex" || $child == "$ex"/* ]] && { skip=1; break; }
+      done
+      [[ $skip -eq 0 ]] && echo "$child"
+    done < <(dataset_tree "$ds")
+  done | awk '!seen[$0]++'
+}
+
+# Fail if any dataset is managed by more than one enabled job: both jobs would
+# prune each other's autosnap_ snapshots with different retention rules.
+check_overlaps() {
+  local id saved_id="$JOB_ID" out="" line
+  local -A owner=()
+  local -A saved=(); for k in "${!J[@]}"; do saved[$k]=${J[$k]}; done
+  for id in $(job_ids); do
+    load_cfg "$JOBS_DIR/$id.cfg" J
+    [[ $(jget ENABLED yes) == yes || $id == "$saved_id" ]] || continue
+    read -r -a JOB_DATASETS <<< "$(jget DATASETS)"
+    read -r -a JOB_EXCLUDES <<< "$(jget EXCLUDE)"
+    JOB_RECURSIVE=$(jget RECURSIVE yes)
+    while IFS= read -r line; do
+      [[ -z $line ]] && continue
+      if [[ -n ${owner[$line]-} && ${owner[$line]} != "$id" ]]; then
+        out+="'$line' is in both job '${owner[$line]}' and job '$id'"$'\n'
+      else
+        owner[$line]=$id
+      fi
+    done < <(expand_job_datasets)
+  done
+  # restore the job we were working on
+  J=(); for k in "${!saved[@]}"; do J[$k]=${saved[$k]}; done
+  [[ -n $saved_id ]] && { JOB_ID=$saved_id; read -r -a JOB_DATASETS <<< "$(jget DATASETS)"; read -r -a JOB_EXCLUDES <<< "$(jget EXCLUDE)"; JOB_RECURSIVE=$(jget RECURSIVE yes); }
+  [[ -z $out ]] && return 0
+  printf '%s' "$out"
+  return 1
+}
+
+# -----------------------------------------------------------------------------
+# sanoid config generation
+# -----------------------------------------------------------------------------
+write_sanoid_config() { # <dir>
+  local dir="$1" ds
+  mkdir -p "$dir"
+  cp "$SANOID_DEFAULTS" "$dir/sanoid.defaults.conf"
+  {
+    echo "# generated by zfsb for job '$JOB_ID' - do not edit, it is rewritten every run"
+    if [[ $JOB_RECURSIVE == zfs ]]; then
+      for ds in "${JOB_DATASETS[@]}"; do
+        printf '[%s]\n\tuse_template = zfsb\n\trecursive = zfs\n\n' "$ds"
+      done
+    else
+      # one explicit section per dataset: deterministic, honours excludes,
+      # and picks up new child datasets on every run
+      while IFS= read -r ds; do
+        [[ -z $ds ]] && continue
+        # sanoid can't parse section names with spaces; run_job warns about these
+        valid_dataset "$ds" || { printf '# skipped (invalid name): %s\n\n' "$ds"; continue; }
+        printf '[%s]\n\tuse_template = zfsb\n\n' "$ds"
+      done < <(expand_job_datasets)
+    fi
+    # every interval is set explicitly - sanoid's own defaults keep 48 hourly / 90 daily / 6 monthly
+    printf '[template_zfsb]\n'
+    printf '\tfrequently = 0\n\thourly = %s\n\tdaily = %s\n\tweekly = %s\n\tmonthly = %s\n\tyearly = %s\n' \
+      "$(jget HOURLY 0)" "$(jget DAILY 0)" "$(jget WEEKLY 0)" "$(jget MONTHLY 0)" "$(jget YEARLY 0)"
+    printf '\tautosnap = yes\n\tautoprune = yes\n'
+  } > "$dir/sanoid.conf"
+}
+
+run_sanoid() { # <action: --take-snapshots|--prune-snapshots> ; sets SANOID_COUNT
+  local action="$1" dir="$STATE_DIR/sanoid/$JOB_ID" rc out
+  local -a args=(--configdir="$dir" --cache-dir="$STATE_DIR/cache/$JOB_ID" --run-dir="$STATE_DIR/run/$JOB_ID" --verbose "$action")
+  [[ $DRY_RUN == yes ]] && args+=(--readonly)
+  # refresh sanoid's snapshot cache first, so a stale cache can never skip a snapshot
+  [[ $action == --take-snapshots ]] && args+=(--force-update)
+  mkdir -p "$STATE_DIR/cache/$JOB_ID" "$STATE_DIR/run/$JOB_ID"
+  out=$("$SANOID" "${args[@]}" 2>&1); rc=$?
+  echo "$out" | sed 's/^/    /'
+  if [[ $action == --take-snapshots ]]; then
+    SANOID_COUNT=$(grep -c '^taking snapshot ' <<< "$out")
+  else
+    SANOID_COUNT=$(grep -c '^INFO: pruning .*@' <<< "$out")
+  fi
+  return $rc
+}
+
+# -----------------------------------------------------------------------------
+# array disk wake-up
+# -----------------------------------------------------------------------------
+# Array ZFS disks are pools named disk1, disk2, ... Snapshotting a spun-down
+# disk works anyway (ZFS wakes it), but one at a time. Waking all the disks a
+# job needs at once, through Unraid's own spin-up command, is faster and keeps
+# the GUI's spin state correct.
+disk_spundown() { # <diskN> -> 0 if spun down
+  awk -v d="[\"$1\"]" '
+    $0 == d { insec = 1; next }
+    /^\[/   { insec = 0 }
+    insec && /^spundown=/ { gsub(/"/, ""); split($0, a, "="); print a[2]; exit }
+  ' "$DISKS_INI" 2>/dev/null | grep -qx 1
+}
+
+wake_disks() { # <diskN>...
+  local d waiting=() start
+  for d in "$@"; do
+    if disk_spundown "$d"; then waiting+=("$d"); else log "  $d is already spinning"; fi
+  done
+  [[ ${#waiting[@]} -eq 0 ]] && return 0
+  if [[ $DRY_RUN == yes ]]; then
+    log "  [dry run] would spin up: ${waiting[*]}"; return 0
+  fi
+  log "  spinning up: ${waiting[*]}"
+  for d in "${waiting[@]}"; do "$EMCMD" "cmdSpinup=$d" >/dev/null 2>&1 & done
+  wait
+  start=$SECONDS
+  while (( SECONDS - start < SPINUP_TIMEOUT )); do
+    local still=()
+    for d in "${waiting[@]}"; do disk_spundown "$d" && still+=("$d"); done
+    [[ ${#still[@]} -eq 0 ]] && { log "  all disks awake after $(( SECONDS - start ))s"; return 0; }
+    sleep 2
+  done
+  warn "disks still reported as spun down after ${SPINUP_TIMEOUT}s (${still[*]}) - continuing, ZFS will wake them on access"
+}
+
+# array disks (diskN) the loaded job will touch: sources plus a local target
+job_array_disks() {
+  {
+    local ds
+    for ds in "${JOB_DATASETS[@]}"; do pool_of "$ds"; done
+    if [[ -z $(jget REPL_HOST) ]]; then
+      case $(jget REPL_METHOD none) in
+        zfs)   pool_of "$(jget REPL_TARGET)" ;;
+        rsync) local t; t=$(jget REPL_TARGET); [[ $t =~ ^$MNT/(disk[0-9]+)(/|$) ]] && echo "${BASH_REMATCH[1]}" ;;
+      esac
+    fi
+  } | grep -E '^disk[0-9]+$' | sort -uV
+}
+
+# -----------------------------------------------------------------------------
+# replication
+# -----------------------------------------------------------------------------
+ssh_args() { # fills SSH_ARGS for the job's remote host
+  SSH_ARGS=(ssh -o BatchMode=yes -o ConnectTimeout=10 -p "$(jget REPL_PORT 22)")
+  [[ -n $(jget REPL_SSH_KEY) ]] && SSH_ARGS+=(-i "$(jget REPL_SSH_KEY)")
+}
+
+remote() { # run a command on the job's remote host (args are quoted for the remote shell)
+  ssh_args
+  "${SSH_ARGS[@]}" "$(jget REPL_USER root)@$(jget REPL_HOST)" "$(printf '%q ' "$@")"
+}
+
+replicate_zfs() {
+  local target_parent remote_host ds dest rc=0
+  target_parent=$(jget REPL_TARGET)
+  remote_host=$(jget REPL_HOST)
+
+  # make sure the parent target dataset exists
+  if [[ $DRY_RUN != yes ]]; then
+    if [[ -n $remote_host ]]; then
+      remote zfs list -H -o name "$target_parent" >/dev/null 2>&1 || remote zfs create -p "$target_parent" \
+        || { err "could not find or create $target_parent on $remote_host"; return 1; }
+    else
+      dataset_exists "$target_parent" || zfs create -p "$target_parent" \
+        || { err "could not create $target_parent"; return 1; }
+    fi
+  fi
+
+  for ds in "${JOB_DATASETS[@]}"; do
+    dest="$target_parent/${ds//\//_}"
+    local -a args=(--no-sync-snap --create-bookmark --no-privilege-elevation)
+    [[ $JOB_RECURSIVE != no ]] && args+=(-r)
+    [[ $(jget REPL_ZFS_MODE strict-mirror) == strict-mirror ]] && args+=(--delete-target-snapshots)
+    local ex
+    for ex in "${JOB_EXCLUDES[@]}"; do args+=(--exclude-datasets="^${ex//./\\.}(/|\$)"); done
+    if [[ -n $remote_host ]]; then
+      args+=(--sshport="$(jget REPL_PORT 22)")
+      [[ -n $(jget REPL_SSH_KEY) ]] && args+=(--sshkey="$(jget REPL_SSH_KEY)")
+      dest="$(jget REPL_USER root)@$remote_host:$dest"
+    fi
+    log "  syncoid ${args[*]} $ds $dest"
+    if [[ $DRY_RUN == yes ]]; then continue; fi
+    if "$SYNCOID" "${args[@]}" "$ds" "$dest" 2>&1 | sed 's/^/    /'; then
+      log "  replicated $ds -> $dest"
+    else
+      err "zfs replication failed: $ds -> $dest"; rc=1
+    fi
+  done
+  return $rc
+}
+
+# rsync one snapshot of one dataset. Child datasets are excluded from the
+# parent's copy (and protected from --delete); they get their own pass.
+rsync_dataset() { # <dataset> <dest-dir> <link-dest-or-empty>
+  local ds="$1" dest="$2" link="$3" mp src child rel
+  mp=$(zfs get -H -o value mountpoint "$ds")
+  [[ $mp == /* ]] || { warn "skipping $ds (not mounted: $mp)"; return 0; }
+  src="$mp/.zfs/snapshot/$RSYNC_SNAP/"
+  local -a args=(-aHAX --numeric-ids --delete)
+  [[ -n $link ]] && args+=(--link-dest="$link")
+  while IFS= read -r child; do
+    [[ $child == "$ds" ]] && continue
+    rel=${child#"$ds"/}
+    [[ $rel == */* ]] && continue      # immediate children only
+    args+=(--exclude="/$rel/")
+  done < <(zfs list -H -r -d 1 -o name -t filesystem "$ds")
+
+  if [[ -n $(jget REPL_HOST) ]]; then
+    remote mkdir -p "$dest" || return 1
+    ssh_args
+    rsync "${args[@]}" -e "${SSH_ARGS[*]}" "$src" "$(jget REPL_USER root)@$(jget REPL_HOST):$dest/"
+  else
+    mkdir -p "$dest" || return 1
+    rsync "${args[@]}" "$src" "$dest/"
+  fi
+}
+
+replicate_rsync() {
+  local base="$(jget REPL_TARGET)" mode rc=0 root ds dest_root dest prev stamp
+  mode=$(jget REPL_RSYNC_MODE incremental)
+  stamp=$(date +%Y-%m-%d_%H%M)
+
+  for root in "${JOB_DATASETS[@]}"; do
+    dest_root="$base/${root//\//_}"
+    prev=""
+    if [[ $mode == incremental ]]; then
+      if [[ -n $(jget REPL_HOST) ]]; then
+        prev=$(remote ls -1 "$dest_root" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4}$' | sort | tail -n1)
+      else
+        prev=$(ls -1 "$dest_root" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4}$' | sort | tail -n1)
+      fi
+    fi
+
+    # every dataset under this root (respects excludes / recursion setting)
+    local -a members=()
+    while IFS= read -r ds; do
+      [[ $ds == "$root" || $ds == "$root"/* ]] && members+=("$ds")
+    done < <(expand_job_datasets)
+
+    for ds in "${members[@]}"; do
+      local rel=""; [[ $ds != "$root" ]] && rel="/${ds#"$root"/}"
+      if [[ $mode == incremental ]]; then
+        dest="$dest_root/$stamp$rel"
+        local link=""; [[ -n $prev ]] && link="$dest_root/$prev$rel"
+      else
+        dest="$dest_root$rel"; local link=""
+      fi
+      log "  rsync $ds -> ${dest}${link:+ (hard-linked against $prev)}"
+      [[ $DRY_RUN == yes ]] && continue
+      zfs destroy "$ds@$RSYNC_SNAP" >/dev/null 2>&1   # leftover from an interrupted run
+      if ! zfs snapshot "$ds@$RSYNC_SNAP"; then err "could not create temporary snapshot $ds@$RSYNC_SNAP"; rc=1; continue; fi
+      if rsync_dataset "$ds" "$dest" "$link" 2>&1 | sed 's/^/    /'; then :; else err "rsync failed: $ds -> $dest"; rc=1; fi
+      zfs destroy "$ds@$RSYNC_SNAP" || warn "could not remove temporary snapshot $ds@$RSYNC_SNAP"
+    done
+
+    # keep only the newest N dated copies (0 = keep all); never prune after a failed run
+    local keep; keep=$(jget REPL_RSYNC_KEEP 0)
+    if [[ $mode == incremental && $rc -eq 0 && $DRY_RUN != yes ]] && is_uint "$keep" && (( keep > 0 )); then
+      local -a dated old
+      if [[ -n $(jget REPL_HOST) ]]; then
+        mapfile -t dated < <(remote ls -1 "$dest_root" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4}$' | sort)
+      else
+        mapfile -t dated < <(ls -1 "$dest_root" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4}$' | sort)
+      fi
+      if (( ${#dated[@]} > keep )); then
+        old=("${dated[@]:0:${#dated[@]}-keep}")
+        local o
+        for o in "${old[@]}"; do
+          log "  removing old rsync copy $dest_root/$o (keeping newest $keep)"
+          if [[ -n $(jget REPL_HOST) ]]; then remote rm -rf "$dest_root/$o"; else rm -rf "${dest_root:?}/$o"; fi
+        done
+      fi
+    fi
+  done
+  return $rc
+}
+
+# -----------------------------------------------------------------------------
+# folder -> dataset converter
+# -----------------------------------------------------------------------------
+declare -a STOPPED_CONTAINERS=() STOPPED_VMS=()
+
+# map /mnt/user/... to the real /mnt/<pool or disk>/... location
+real_location() {
+  local p="$1" d
+  [[ $p == "$MNT"/user/* ]] || { echo "$p"; return 0; }
+  for d in "$MNT"/*/; do
+    d=${d%/}
+    [[ $d == "$MNT/user" || $d == "$MNT/user0" ]] && continue
+    [[ -e "$d${p#"$MNT"/user}" ]] && { echo "$d${p#"$MNT"/user}"; return 0; }
+  done
+  echo "$p"
+}
+
+# the candidate folder (if any) a path falls under: prints "<parent-mountpoint>/<child>"
+candidate_for_path() { # <path> <mountpoint> <candidate-names...>
+  local p="$1" mp="$2"; shift 2
+  local c
+  for c in "$@"; do
+    [[ $p == "$mp/$c" || $p == "$mp/$c"/* ]] && { echo "$mp/$c"; return 0; }
+  done
+  return 1
+}
+
+convert_restart_all() {
+  local c v
+  for c in "${STOPPED_CONTAINERS[@]}"; do
+    log "  starting container $c"; docker start "$c" >/dev/null || err "could not restart container $c"
+  done
+  for v in "${STOPPED_VMS[@]}"; do
+    log "  starting VM $v"; virsh start "$v" >/dev/null || err "could not restart VM $v"
+  done
+  STOPPED_CONTAINERS=(); STOPPED_VMS=()
+}
+
+files_signature() { # "<file count> <total bytes>"
+  find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{n++; s+=$1} END {printf "%d %d\n", n, s}'
+}
+
+run_convert() { # [parents...]  (defaults to every configured parent)
+  local -A C; load_cfg "$CONVERT_CFG" C || { log "converter is not configured"; return 0; }
+  local -a parents=("$@")
+  [[ ${#parents[@]} -eq 0 ]] && read -r -a parents <<< "${C[PARENTS]-}"
+  [[ ${#parents[@]} -eq 0 ]] && { log "converter: no parent datasets configured"; return 0; }
+  local stop_containers=${C[STOP_CONTAINERS]:-yes} stop_vms=${C[STOP_VMS]:-no}
+  local vm_wait=${C[VM_WAIT]:-90} replace_spaces=${C[REPLACE_SPACES]:-no}
+  local dry=$DRY_RUN; [[ ${C[DRY_RUN]-no} == yes ]] && dry=yes
+  local rc=0 parent mp entry name newname
+
+  for parent in "${parents[@]}"; do
+    log "Converter: checking $parent"
+    if ! dataset_exists "$parent"; then err "converter: $parent is not a dataset"; rc=1; continue; fi
+    mp=$(zfs get -H -o value mountpoint "$parent")
+    [[ -d $mp ]] || { err "converter: $parent is not mounted"; rc=1; continue; }
+
+    # collect folders that are not datasets yet
+    local -a cands=() targets=()
+    for entry in "$mp"/*/; do
+      entry=${entry%/}; name=${entry##*/}
+      [[ $name == *"$CONVERT_SUFFIX" ]] && { warn "found leftover $entry from an interrupted conversion - fix it by hand"; continue; }
+      dataset_exists "$parent/$name" && continue
+      newname=$name
+      [[ $replace_spaces == yes ]] && newname=${newname// /_}
+      if ! valid_dataset "$parent/$newname"; then
+        warn "skipping '$name': not a valid dataset name (spaces or special characters)"; continue
+      fi
+      dataset_exists "$parent/$newname" && { warn "skipping '$name': dataset $parent/$newname already exists"; continue; }
+      cands+=("$name"); targets+=("$newname")
+    done
+    [[ ${#cands[@]} -eq 0 ]] && { log "  nothing to convert"; continue; }
+    log "  folders to convert: ${cands[*]}"
+
+    # stop containers / VMs whose data lives in those folders; always restart them,
+    # even if this run is interrupted
+    trap convert_restart_all EXIT
+    trap 'exit 130' INT TERM
+    if [[ $stop_containers == yes ]] && command -v docker >/dev/null; then
+      local cid cname src hit
+      while IFS= read -r cid; do
+        [[ -z $cid ]] && continue
+        cname=$(docker inspect --format '{{.Name}}' "$cid" | cut -c2-)
+        hit=""
+        while IFS= read -r src; do
+          [[ -z $src ]] && continue
+          src=$(real_location "$src")
+          hit=$(candidate_for_path "$src" "$mp" "${cands[@]}") && break
+        done < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$cid")
+        [[ -z $hit ]] && continue
+        if [[ $dry == yes ]]; then log "  [dry run] would stop container $cname (uses $hit)"; continue; fi
+        log "  stopping container $cname (uses $hit)"
+        docker stop "$cid" >/dev/null && STOPPED_CONTAINERS+=("$cname") || { err "could not stop $cname"; rc=1; }
+      done < <(docker ps -q)
+    fi
+    if [[ $stop_vms == yes ]] && command -v virsh >/dev/null; then
+      local vm disk hit
+      while IFS= read -r vm; do
+        [[ -z $vm ]] && continue
+        hit=""
+        while IFS= read -r disk; do
+          disk=$(real_location "$disk")
+          hit=$(candidate_for_path "$disk" "$mp" "${cands[@]}") && break
+        done < <(virsh domblklist "$vm" --details 2>/dev/null | awk '$1=="file" && $2=="disk" {print $4}')
+        [[ -z $hit ]] && continue
+        if [[ $dry == yes ]]; then log "  [dry run] would shut down VM $vm (uses $hit)"; continue; fi
+        log "  shutting down VM $vm (uses $hit)"
+        virsh shutdown "$vm" >/dev/null
+        local t0=$SECONDS
+        while virsh domstate "$vm" 2>/dev/null | grep -q running; do
+          (( SECONDS - t0 >= vm_wait )) && { warn "VM $vm did not shut down in ${vm_wait}s - forcing off"; virsh destroy "$vm" >/dev/null; break; }
+          sleep 3
+        done
+        STOPPED_VMS+=("$vm")
+      done < <(virsh list --name --state-running)
+    fi
+
+    # convert
+    local i
+    for i in "${!cands[@]}"; do
+      name=${cands[$i]}; newname=${targets[$i]}
+      local src="$mp/$name" tmp="$mp/$newname$CONVERT_SUFFIX" ds="$parent/$newname"
+      local size avail
+      size=$(du -sb "$src" | cut -f1)
+      avail=$(zfs get -H -p -o value available "$parent")
+      if (( avail < size + size / 10 )); then
+        err "not enough space to convert $src ($(( size / 1048576 )) MiB needed + 10%)"; rc=1; continue
+      fi
+      if [[ $dry == yes ]]; then log "  [dry run] would convert $src -> dataset $ds"; continue; fi
+      log "  converting $src -> $ds"
+      mv "$src" "$tmp" || { err "could not rename $src"; rc=1; continue; }
+      if ! zfs create "$ds"; then
+        err "could not create dataset $ds - restoring folder"; mv "$tmp" "$src"; rc=1; continue
+      fi
+      if rsync -aHAX --numeric-ids "$tmp/" "$mp/$newname/" 2>&1 | sed 's/^/    /' \
+         && [[ "$(files_signature "$tmp")" == "$(files_signature "$mp/$newname")" ]]; then
+        rm -rf "$tmp"
+        log "  converted $name ($(files_signature "$mp/$newname" | awk '{print $1}') files verified)"
+        CONVERTED+=("$ds")
+      else
+        # roll back: drop the dataset we just created and put the folder back
+        err "copy/verify failed for $name - rolling back"
+        zfs destroy "$ds" && mv "$tmp" "$src" || err "ROLLBACK FAILED for $name: original data is in $tmp"
+        rc=1
+      fi
+    done
+    convert_restart_all
+    trap - EXIT INT TERM
+  done
+  return $rc
+}
+
+# -----------------------------------------------------------------------------
+# status
+# -----------------------------------------------------------------------------
+write_status() { # <state> <summary>
+  local dir="$STATE_DIR/status" persist="$CFG_DIR/status"
+  mkdir -p "$dir" "$persist"
+  jq -n --arg job "$JOB_ID" --arg name "$JOB_NAME" --arg state "$1" --arg summary "$2" \
+        --argjson started "${RUN_STARTED:-0}" --argjson finished "$(date +%s)" \
+        --argjson taken "${TAKEN:-0}" --argjson pruned "${PRUNED:-0}" --arg dry "$DRY_RUN" \
+        '{job:$job, name:$name, state:$state, summary:$summary, started:$started,
+          finished:$finished, taken:$taken, pruned:$pruned, dry_run:($dry=="yes")}' \
+        > "$dir/$JOB_ID.json"
+  # keep the last finished result on the flash drive so it survives reboots
+  [[ $1 != running ]] && cp "$dir/$JOB_ID.json" "$persist/$JOB_ID.json"
+}
+
+# -----------------------------------------------------------------------------
+# commands
+# -----------------------------------------------------------------------------
+run_job() { # <id>
+  local id="$1"
+  load_job "$id"
+  WARNINGS=(); ERRORS=(); CONVERTED=(); TAKEN=0; PRUNED=0; RUN_STARTED=$(date +%s)
+  local tag=""; [[ $DRY_RUN == yes ]] && tag=" (DRY RUN)"
+  log "===== Job '$JOB_NAME' ($id) started$tag ====="
+  write_status running "Running"
+
+  local problems
+  if ! problems=$(validate_job) || ! problems+=$(check_overlaps); then
+    while IFS= read -r p; do [[ -n $p ]] && err "$p"; done <<< "$problems"
+    write_status failed "Configuration problem: ${ERRORS[0]}"
+    notify alert "ZFS Backups: $JOB_NAME failed" "${ERRORS[*]}"
+    return 1
+  fi
+
+  # 1. convert new folders first, so new containers get their own snapshots tonight
+  local -A C=(); load_cfg "$CONVERT_CFG" C
+  if [[ ${C[ENABLED]-no} == yes && ${C[MODE]-before_jobs} == before_jobs ]]; then
+    local -a mine=(); local p ds
+    for p in ${C[PARENTS]-}; do
+      for ds in "${JOB_DATASETS[@]}"; do
+        [[ $p == "$ds" || ( $JOB_RECURSIVE != no && $p == "$ds"/* ) ]] && { mine+=("$p"); break; }
+      done
+    done
+    [[ ${#mine[@]} -gt 0 ]] && { run_convert "${mine[@]}" || true; }
+  fi
+
+  # 2. wake the array disks this job needs, all at once
+  if [[ $(jget WAKE_DISKS yes) == yes ]]; then
+    local -a disks; mapfile -t disks < <(job_array_disks)
+    if [[ ${#disks[@]} -gt 0 ]]; then log "Waking array disks: ${disks[*]}"; wake_disks "${disks[@]}"; fi
+  fi
+
+  # 3. snapshots
+  local bad
+  while IFS= read -r bad; do
+    valid_dataset "$bad" || warn "dataset '$bad' has spaces or special characters in its name - it is skipped (rename it to include it)"
+  done < <(expand_job_datasets)
+  write_sanoid_config "$STATE_DIR/sanoid/$id"
+  log "Taking snapshots (keep: $(jget HOURLY 0)h $(jget DAILY 0)d $(jget WEEKLY 0)w $(jget MONTHLY 0)m $(jget YEARLY 0)y)"
+  if run_sanoid --take-snapshots; then TAKEN=$SANOID_COUNT; log "  $TAKEN snapshot(s) taken"
+  else TAKEN=$SANOID_COUNT; err "sanoid reported an error while taking snapshots"; fi
+
+  # 4. replication - before pruning, so the previous snapshot is still there as the incremental base
+  local repl
+  repl=$(jget REPL_METHOD none)
+  if [[ $repl != none ]]; then
+    log "Replicating ($repl -> ${J[REPL_HOST]:+${J[REPL_HOST]}:}$(jget REPL_TARGET))"
+    if [[ -n $(jget REPL_HOST) && $DRY_RUN != yes ]] && ! remote true >/dev/null 2>&1; then
+      err "cannot reach $(jget REPL_USER root)@$(jget REPL_HOST) over ssh (check keys and port)"
+    else
+      "replicate_$repl" || true
+    fi
+  fi
+
+  # 5. prune
+  log "Pruning old snapshots"
+  if run_sanoid --prune-snapshots; then PRUNED=$SANOID_COUNT; log "  $PRUNED snapshot(s) pruned"
+  else PRUNED=$SANOID_COUNT; err "sanoid reported an error while pruning"; fi
+
+  # 6. report
+  local summary="$TAKEN taken, $PRUNED pruned"
+  [[ ${#CONVERTED[@]} -gt 0 ]] && summary+=", ${#CONVERTED[@]} folder(s) converted"
+  [[ $repl != none ]] && summary+=", replicated via $repl"
+  local secs=$(( $(date +%s) - RUN_STARTED ))
+  if [[ ${#ERRORS[@]} -gt 0 ]]; then
+    log "===== Job '$JOB_NAME' FAILED after ${secs}s: ${ERRORS[*]} ====="
+    write_status failed "$summary - ${#ERRORS[@]} error(s): ${ERRORS[0]}"
+    notify alert "ZFS Backups: $JOB_NAME failed$tag" "${ERRORS[*]}"
+    return 1
+  elif [[ ${#WARNINGS[@]} -gt 0 ]]; then
+    log "===== Job '$JOB_NAME' finished with warnings after ${secs}s ($summary) ====="
+    write_status warning "$summary - ${WARNINGS[0]}"
+    notify warning "ZFS Backups: $JOB_NAME finished with warnings$tag" "$summary. ${WARNINGS[*]}"
+  else
+    log "===== Job '$JOB_NAME' finished OK after ${secs}s ($summary) ====="
+    write_status success "$summary"
+    notify normal "ZFS Backups: $JOB_NAME OK$tag" "$summary"
+  fi
+  return 0
+}
+
+with_job_log() { # <id> <command...>  - tee output into the job's log, rotate at 2 MB
+  local id="$1"; shift
+  mkdir -p "$LOG_DIR"
+  local f="$LOG_DIR/$id.log"
+  [[ -f $f && $(stat -c %s "$f" 2>/dev/null || echo 0) -gt 2097152 ]] && mv -f "$f" "$f.1"
+  "$@" 2>&1 | tee -a "$f"
+  return "${PIPESTATUS[0]}"
+}
+
+cmd_run() {
+  local id="" a
+  for a in "$@"; do
+    case $a in
+      --dry-run) DRY_RUN=yes ;;
+      --cron) ;;
+      -*) die "unknown option $a" ;;
+      *) id=$a ;;
+    esac
+  done
+  [[ -n $id ]] || die "usage: zfsb run <job> [--dry-run]"
+  acquire_lock
+  with_job_log "$id" run_job "$id"
+}
+
+cmd_run_all() {
+  [[ ${1-} == --dry-run ]] && DRY_RUN=yes
+  acquire_lock
+  local id rc=0 enabled
+  for id in $(job_ids); do
+    local -A T=(); load_cfg "$JOBS_DIR/$id.cfg" T; enabled=${T[ENABLED]:-yes}
+    [[ $enabled == yes ]] || continue
+    with_job_log "$id" run_job "$id" || rc=1
+  done
+  return $rc
+}
+
+cmd_convert() {
+  [[ ${1-} == --dry-run ]] && DRY_RUN=yes
+  acquire_lock
+  CONVERTED=()
+  local id=_convert
+  mkdir -p "$LOG_DIR"
+  { log "===== Folder -> dataset conversion started$([[ $DRY_RUN == yes ]] && echo ' (DRY RUN)') ====="
+    run_convert; local rc=$?
+    log "===== Conversion finished: ${#CONVERTED[@]} converted, ${#ERRORS[@]} error(s) ====="
+    local -A C=(); load_cfg "$CONVERT_CFG" C; NOTIFY_MODE=${C[NOTIFY]:-all}
+    if [[ ${#ERRORS[@]} -gt 0 ]]; then notify alert "ZFS Backups: dataset conversion failed" "${ERRORS[*]}"
+    elif [[ ${#CONVERTED[@]} -gt 0 ]]; then notify normal "ZFS Backups: converted ${#CONVERTED[@]} folder(s)" "${CONVERTED[*]}"; fi
+    return $rc
+  } 2>&1 | tee -a "$LOG_DIR/$id.log"
+  return "${PIPESTATUS[0]}"
+}
+
+cmd_plan() {
+  local id="${1-}"; [[ -n $id ]] || die "usage: zfsb plan <job>"
+  load_job "$id"
+  DRY_RUN=yes
+  echo "Job:        $JOB_NAME ($id)"
+  echo "Enabled:    $(jget ENABLED yes)"
+  echo "Schedule:   $(cron_expr_for_job || echo 'manual only')"
+  echo "Retention:  hourly=$(jget HOURLY 0) daily=$(jget DAILY 0) weekly=$(jget WEEKLY 0) monthly=$(jget MONTHLY 0) yearly=$(jget YEARLY 0)"
+  echo "Recursion:  $JOB_RECURSIVE${JOB_EXCLUDES[*]:+  (excluding: ${JOB_EXCLUDES[*]})}"
+  echo
+  local problems; problems=$(validate_job; check_overlaps)
+  if [[ -n $problems ]]; then echo "Problems:"; sed 's/^/  - /' <<< "$problems"; echo; fi
+  echo "Datasets managed:"; expand_job_datasets | sed 's/^/  /'
+  echo
+  local -a disks; mapfile -t disks < <(job_array_disks)
+  echo "Array disks to wake: ${disks[*]:-none}"
+  echo "Replication: $(jget REPL_METHOD none)${J[REPL_TARGET]:+ -> ${J[REPL_HOST]:+${J[REPL_USER]:-root}@${J[REPL_HOST]}:}${J[REPL_TARGET]}}"
+  echo
+  [[ -n $problems ]] && return 1
+  echo "Simulated snapshot run (sanoid --readonly):"
+  write_sanoid_config "$STATE_DIR/sanoid/$id"
+  run_sanoid --take-snapshots; echo "  -> would take $SANOID_COUNT snapshot(s)"
+  run_sanoid --prune-snapshots; echo "  -> would prune $SANOID_COUNT snapshot(s)"
+}
+
+cmd_validate() {
+  local id rc=0 problems
+  for id in $(job_ids); do
+    load_job "$id"
+    if problems=$(validate_job; check_overlaps) && [[ -z $problems ]]; then
+      echo "$id: OK"
+    else
+      echo "$id:"; sed 's/^/  - /' <<< "$problems"; rc=1
+    fi
+  done
+  return $rc
+}
+
+# Other sanoid configs / scripts on this box that manage the same datasets.
+cmd_conflicts() {
+  local -A mine=()
+  local id ds f sec
+  for id in $(job_ids); do
+    load_job "$id"; [[ $(jget ENABLED yes) == yes ]] || continue
+    while IFS= read -r ds; do mine[$ds]=$id; done < <(expand_job_datasets)
+  done
+  local found=0
+  local -a files
+  if [[ -n ${ZFSB_CONFLICT_FILES-} ]]; then read -r -a files <<< "$ZFSB_CONFLICT_FILES"
+  else files=(/boot/config/plugins/buddybackup/sanoid.conf /etc/sanoid/sanoid.conf /usr/local/emhttp/*/sanoid.conf); fi
+  for f in "${files[@]}"; do
+    [[ -f $f ]] || continue
+    while IFS= read -r sec; do
+      [[ $sec == template_* ]] && continue
+      for ds in "${!mine[@]}"; do
+        if [[ $ds == "$sec" || $ds == "$sec"/* ]]; then
+          echo "$f manages '$sec' (overlaps job '${mine[$ds]}')"; found=1; break
+        fi
+      done
+    done < <(grep -oE '^\[[^]]+\]' "$f" | tr -d '[]')
+  done
+  [[ $found -eq 0 ]] && echo "No conflicts found."
+  return 0
+}
+
+cron_expr() { # <prefix>: reads SCHEDULE / SCHEDULE_TIME / SCHEDULE_DOW / SCHEDULE_CRON from assoc array C2
+  local mode="${C2[SCHEDULE]:-disabled}" time="${C2[SCHEDULE_TIME]:-00:30}" dow="${C2[SCHEDULE_DOW]:-0}" h m
+  [[ $time =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || time="00:30"
+  h=$(( 10#${time%%:*} )); m=$(( 10#${time##*:} ))
+  case $mode in
+    daily)  echo "$m $h * * *" ;;
+    hourly) echo "$m * * * *" ;;
+    weekly) [[ $dow =~ ^[0-6]$ ]] || dow=0; echo "$m $h * * $dow" ;;
+    custom) local c="${C2[SCHEDULE_CRON]-}"
+            [[ $c =~ ^[0-9*/,-]+([[:space:]]+[0-9*/,-]+){4}$ ]] && echo "$c" || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+cron_expr_for_job() {
+  local -A C2=(); local k; for k in "${!J[@]}"; do C2[$k]=${J[$k]}; done
+  cron_expr
+}
+
+cmd_cron() {
+  local out="$CFG_DIR/$PLUGIN.cron" id expr
+  {
+    echo "# Generated by ZFS Backups - edit jobs in the WebGUI instead"
+    for id in $(job_ids); do
+      local -A C2=(); load_cfg "$JOBS_DIR/$id.cfg" C2
+      [[ ${C2[ENABLED]:-yes} == yes ]] || continue
+      expr=$(cron_expr) || continue
+      echo "$expr /usr/local/sbin/zfsb run $id --cron >/dev/null 2>&1"
+    done
+    local -A C2=(); load_cfg "$CONVERT_CFG" C2
+    if [[ ${C2[ENABLED]-no} == yes && ${C2[MODE]-} == schedule ]] && expr=$(cron_expr); then
+      echo "$expr /usr/local/sbin/zfsb convert >/dev/null 2>&1"
+    fi
+  } > "$out.tmp" && mv -f "$out.tmp" "$out"
+  [[ -x $UPDATE_CRON ]] && "$UPDATE_CRON"
+  cat "$out"
+}
+
+cmd_status() {
+  local f first=1
+  echo "["
+  for f in "$STATE_DIR"/status/*.json "$CFG_DIR"/status/*.json; do
+    local id=${f##*/}; id=${id%.json}
+    # prefer the live (RAM) status; fall back to the persisted one
+    [[ $f == "$CFG_DIR"/* && -f $STATE_DIR/status/$id.json ]] && continue
+    [[ $first -eq 1 ]] && first=0 || echo ","
+    cat "$f"
+  done
+  echo "]"
+}
+
+main() {
+  DRY_RUN=no
+  local cmd="${1-}"; shift || true
+  case $cmd in
+    run)       cmd_run "$@" ;;
+    run-all)   cmd_run_all "$@" ;;
+    convert)   cmd_convert "$@" ;;
+    plan)      cmd_plan "$@" ;;
+    validate)  cmd_validate ;;
+    conflicts) cmd_conflicts ;;
+    cron)      cmd_cron ;;
+    status)    cmd_status ;;
+    ""|-h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$cmd' (try: zfsb help)" ;;
+  esac
+}
+
+[[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"

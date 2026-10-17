@@ -1,0 +1,158 @@
+Menu="ZFSBackups:2"
+Title="Dataset Conversion"
+Markdown="false"
+---
+<div class="zfsb" id="zb-convert">
+  <p class="muted">Watches parent datasets such as <code>appdata</code> or <code>domains</code> and turns any plain
+  folder inside them into its own child dataset, so every container or VM gets its own snapshots and can be rolled
+  back on its own. Containers and VMs using a folder are stopped while it is copied, and started again afterwards.
+  Each copy is verified (file count and total size) before the original is removed; if anything fails, the folder
+  is put back exactly as it was.</p>
+
+  <form class="panel" id="zb-cv" onsubmit="return false">
+    <div class="grid">
+      <label>Enabled</label>
+      <select name="ENABLED"><option value="no">No</option><option value="yes">Yes</option></select>
+
+      <label>When to run</label>
+      <select name="MODE">
+        <option value="before_jobs">At the start of any snapshot job that covers the dataset (recommended)</option>
+        <option value="schedule">On its own schedule</option>
+        <option value="manual">Only when I click Run now</option>
+      </select>
+
+      <label class="zb-cv-sched">Schedule</label>
+      <div class="zb-cv-sched">
+        <select name="SCHEDULE">
+          <option value="daily">Daily</option><option value="weekly">Weekly</option><option value="hourly">Hourly</option>
+          <option value="custom">Custom (cron)</option>
+        </select>
+        <select name="SCHEDULE_DOW" class="zb-dow">
+          <option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option>
+          <option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option>
+        </select>
+        <span class="zb-time">at <input type="time" name="SCHEDULE_TIME" style="width: 110px"></span>
+        <input type="text" name="SCHEDULE_CRON" class="zb-cron" placeholder="m h dom mon dow" style="width: 200px">
+      </div>
+
+      <label>Watch these datasets</label>
+      <div>
+        <div class="dslist">
+          <table><thead><tr><td>Dataset</td><td class="cb">Watch</td><td style="text-align:right">Used</td></tr></thead>
+          <tbody id="zb-cv-ds"></tbody></table>
+        </div>
+      </div>
+      <div class="hint muted">Only folders <em>directly</em> inside a watched dataset are converted.</div>
+
+      <label>Stop Docker containers</label>
+      <select name="STOP_CONTAINERS">
+        <option value="yes">Yes — stop only containers whose data is in a folder being converted</option>
+        <option value="no">No — skip folders in use (not recommended)</option>
+      </select>
+
+      <label>Stop VMs</label>
+      <div>
+        <select name="STOP_VMS">
+          <option value="no">No</option>
+          <option value="yes">Yes — shut down VMs whose vdisk is in a folder being converted</option>
+        </select>
+        force off after <input type="number" name="VM_WAIT" min="10" max="3600" style="width: 70px"> s
+      </div>
+
+      <label>Folder names with spaces</label>
+      <select name="REPLACE_SPACES">
+        <option value="no">Skip them (they can't be snapshotted by sanoid)</option>
+        <option value="yes">Convert, replacing spaces with _ (update container paths afterwards!)</option>
+      </select>
+
+      <label>Dry run mode</label>
+      <select name="DRY_RUN">
+        <option value="no">Off — convert for real</option>
+        <option value="yes">On — only log what would be converted</option>
+      </select>
+
+      <label>Notifications</label>
+      <select name="NOTIFY">
+        <option value="all">Conversions and failures</option><option value="error">Failures only</option><option value="none">None</option>
+      </select>
+
+      <span></span>
+      <div>
+        <div id="zb-cv-msg" class="alert hidden"></div>
+        <input type="button" value="Save" id="zb-cv-save">
+        <input type="button" value="Dry run now" id="zb-cv-dry">
+        <input type="button" value="Run now" id="zb-cv-run">
+      </div>
+    </div>
+  </form>
+</div>
+
+<script>
+(function () {
+  var watch = {};
+  var FIELDS = ['ENABLED', 'MODE', 'SCHEDULE', 'SCHEDULE_DOW', 'SCHEDULE_TIME', 'SCHEDULE_CRON', 'STOP_CONTAINERS',
+                'STOP_VMS', 'VM_WAIT', 'REPLACE_SPACES', 'DRY_RUN', 'NOTIFY'];
+
+  function msg(cls, html) { $('#zb-cv-msg').removeClass('hidden bad good').addClass(cls).html(html); }
+
+  function sync() {
+    var mode = $('#zb-cv [name=MODE]').val(), s = $('#zb-cv [name=SCHEDULE]').val();
+    $('.zb-cv-sched').toggleClass('hidden', mode !== 'schedule');
+    $('#zb-cv .zb-dow').toggle(s === 'weekly');
+    $('#zb-cv .zb-time').toggle(s !== 'custom');
+    $('#zb-cv .zb-cron').toggle(s === 'custom');
+  }
+
+  function renderDs() {
+    var $tb = $('#zb-cv-ds').empty();
+    (ZFSB.datasets || []).forEach(function (d) {
+      var depth = d.name.split('/').length - 1;
+      var $cb = $('<input type="checkbox">').prop('checked', !!watch[d.name]).prop('disabled', !d.valid)
+        .on('change', function () { if (this.checked) watch[d.name] = 1; else delete watch[d.name]; });
+      $('<tr>').append(
+        $('<td>').css('padding-left', 8 + depth * 18).text(d.name.split('/').pop()).attr('title', d.name),
+        $('<td class="cb">').append($cb),
+        $('<td class="muted" style="text-align:right">').text(ZFSB.size(d.used))
+      ).appendTo($tb);
+    });
+  }
+
+  function load() {
+    ZFSB.call('get_convert').done(function (r) {
+      var c = r.cfg || {};
+      FIELDS.forEach(function (k) { $('#zb-cv [name=' + k + ']').val(c[k]); });
+      watch = {}; (c.PARENTS || '').split(' ').filter(Boolean).forEach(function (p) { watch[p] = 1; });
+      sync();
+      ZFSB.loadDatasets().done(renderDs);
+    });
+  }
+
+  function save() {
+    var cfg = {};
+    FIELDS.forEach(function (k) { cfg[k] = $('#zb-cv [name=' + k + ']').val(); });
+    cfg.PARENTS = Object.keys(watch).sort().join(' ');
+    return ZFSB.call('save_convert', { cfg: cfg }).done(function (r) {
+      if (r.ok) msg('good', 'Saved.'); else msg('bad', ZFSB.errors(r).map(ZFSB.esc).join('<br>'));
+    });
+  }
+
+  function runNow(dry) {
+    if (!dry && !confirm('Convert folders to datasets now?\n\nContainers/VMs using those folders will be stopped while they are copied.')) return;
+    save().done(function (r) {
+      if (!r.ok) return;
+      ZFSB.call('run_convert', { dry: dry ? 'yes' : 'no' }).done(function () {
+        msg('good', (dry ? 'Dry run' : 'Conversion') + ' started — see the Logs tab.');
+        if (window.ZFSBLogs) ZFSBLogs.show('_convert', true);
+      });
+    });
+  }
+
+  $(function () {
+    $('#zb-cv').on('change', 'select', sync);
+    $('#zb-cv-save').on('click', save);
+    $('#zb-cv-dry').on('click', function () { runNow(true); });
+    $('#zb-cv-run').on('click', function () { runNow(false); });
+    load();
+  });
+})();
+</script>

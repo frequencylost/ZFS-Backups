@@ -1,0 +1,3 @@
+#!/bin/bash
+: "${ZFSMOCK:?}"; echo "virsh $*" >> "$ZFSMOCK/calls.log"
+case $1 in list) cat "$ZFSMOCK/vms" 2>/dev/null ;; *) exit 0 ;; esac

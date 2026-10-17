@@ -1,0 +1,15 @@
+#!/bin/bash
+# Fake docker. $ZFSMOCK/containers: id<TAB>name<TAB>running(0/1)<TAB>bind-source[,bind-source...]
+: "${ZFSMOCK:?}"; C="$ZFSMOCK/containers"; touch "$C"
+echo "docker $*" >> "$ZFSMOCK/calls.log"
+row() { awk -F'\t' -v k="$1" '$1==k || $2==k' "$C"; }
+set_running() { awk -F'\t' -v OFS='\t' -v k="$1" -v r="$2" '($1==k||$2==k){$3=r} 1' "$C" > "$C.tmp" && mv "$C.tmp" "$C"; }
+case $1 in
+  ps)      awk -F'\t' '$3==1{print $1}' "$C" ;;
+  inspect) fmt=$3; id=$4
+           if [[ $fmt == *Mounts* ]]; then row "$id" | cut -f4 | tr ',' '\n'
+           else echo "/$(row "$id" | cut -f2)"; fi ;;
+  stop)    set_running "$2" 0; echo "$2" ;;
+  start)   set_running "$2" 1; echo "$2" ;;
+  *) echo "mock docker: unsupported $1" >&2; exit 1 ;;
+esac

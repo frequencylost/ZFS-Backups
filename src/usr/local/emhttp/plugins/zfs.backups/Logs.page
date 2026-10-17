@@ -1,0 +1,63 @@
+Menu="ZFSBackups:3"
+Title="Logs"
+Markdown="false"
+---
+<div class="zfsb" id="zb-logs">
+  <p>
+    <select id="zb-log-name"></select>
+    <label style="margin-left: 12px"><input type="checkbox" id="zb-log-follow" checked> follow</label>
+    <span id="zb-log-state" class="muted" style="margin-left: 12px"></span>
+  </p>
+  <textarea class="log" id="zb-log" readonly>Loading…</textarea>
+  <p class="muted">Logs are kept in RAM (<code>/var/log/zfs.backups/</code>) and are cleared on reboot. The last result
+  of every job is kept on the flash drive and shown on the Snapshot Jobs tab.</p>
+</div>
+
+<script>
+var ZFSBLogs = (function () {
+  var timer = null, current = null;
+
+  function label(n) { return n === '_convert' ? 'Dataset conversion' : 'Job: ' + n; }
+
+  function fill(selected) {
+    return ZFSB.call('logs').done(function (r) {
+      var names = r.logs || [], $s = $('#zb-log-name').empty();
+      if (selected && names.indexOf(selected) < 0) names.push(selected);
+      names.sort().forEach(function (n) { $('<option>').val(n).text(label(n)).appendTo($s); });
+      if (!names.length) $('<option value="">').text('No logs yet').appendTo($s);
+      $s.val(selected || current || names[0] || '');
+    });
+  }
+
+  function poll() {
+    clearTimeout(timer);
+    current = $('#zb-log-name').val();
+    if (!current) { $('#zb-log').val('Nothing has run yet.'); return; }
+    ZFSB.call('log', { name: current, lines: 1500 }).done(function (r) {
+      var $t = $('#zb-log');
+      if ($t.val() !== r.text) {
+        $t.val(r.text || '(empty)');
+        if ($('#zb-log-follow').prop('checked')) $t.scrollTop($t[0].scrollHeight);
+      }
+      $('#zb-log-state').text(r.running ? 'running…' : '');
+      timer = setTimeout(poll, r.running ? 1500 : 6000);
+    });
+  }
+
+  function show(name, jump) {
+    fill(name).done(poll);
+    if (jump) {   // switch to this tab (Unraid tabs are radio inputs inside a .tab wrapper)
+      var $radio = $('#zb-logs').closest('.tab').children('input[type=radio]');
+      if (!$radio.length) $radio = $('#tab3');
+      if ($radio.length) $radio.prop('checked', true).trigger('click').trigger('change');
+      else $('#zb-logs')[0].scrollIntoView();
+    }
+  }
+
+  $(function () {
+    $('#zb-log-name').on('change', poll);
+    fill().done(poll);
+  });
+  return { show: show };
+})();
+</script>
