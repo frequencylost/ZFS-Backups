@@ -3,14 +3,14 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "zfs.backups">
   <!ENTITY author    "FrequencyLost">
-  <!ENTITY version   "2026.10.17">
+  <!ENTITY version   "2026.10.17a">
   <!ENTITY launch    "Settings/ZFSBackups">
   <!ENTITY gitURL    "https://raw.githubusercontent.com/frequencylost/ZFS-Backups/main">
   <!ENTITY pluginURL "&gitURL;/&name;.plg">
   <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
   <!ENTITY pkgPath   "/boot/config/plugins/&name;">
   <!ENTITY pkgName   "&name;-&version;-noarch-1.txz">
-  <!ENTITY pkgMD5    "99f11a4e84f2db3d53b7df1908aee4b9">
+  <!ENTITY pkgMD5    "750943b45ab13dc2b6f68c19b43c587c">
 ]>
 
 <PLUGIN name="&name;"
@@ -25,16 +25,22 @@
 <CHANGES>
 ##ZFS Backups
 
+###2026.10.17a
+- Conflict check only reports tools that are still active: configs left behind by an uninstalled plugin or an unscheduled User Script are ignored
+- Perl dependencies are always kept on the flash drive, so they can be installed at boot without internet access
+
 ###2026.10.17
 - Initial release: per-job snapshot retention (sanoid), ZFS/rsync replication, folder to dataset conversion, array disk wake-up
 </CHANGES>
 
-<!-- Perl modules sanoid/syncoid need. Skipped when another plugin already provides them. -->
+<!-- Perl modules sanoid/syncoid need. Always kept on the flash drive so they can be installed at boot without
+     internet access (e.g. after another plugin that provided them is removed); only installed when missing. -->
 <FILE Run="/bin/bash">
 <INLINE>
+need=yes
 if perl -MConfig::IniFiles -MCapture::Tiny -MList::MoreUtils -MExporter::Tiny -e1 2>/dev/null; then
+  need=no
   echo "Perl modules for sanoid are already installed."
-  exit 0
 fi
 mkdir -p &pkgPath;/deps
 # md5:package  (no heredocs here - a bare less-than sign is not allowed in plugin XML)
@@ -46,10 +52,14 @@ for entry in \
   md5=${entry%%:*}; pkg=${entry#*:}; f="&pkgPath;/deps/$pkg"
   if [ ! -f "$f" ]; then
     echo "Downloading $pkg ..."
-    if ! curl -fsSL --retry 3 -o "$f" "&gitURL;/deps/$pkg"; then rm -f "$f"; echo "Download of $pkg failed."; exit 1; fi
+    if ! curl -fsSL --retry 3 -o "$f" "&gitURL;/deps/$pkg"; then
+      rm -f "$f"
+      if [ "$need" = yes ]; then echo "Download of $pkg failed."; exit 1; fi
+      echo "Could not cache $pkg on the flash drive (not needed right now)."; continue
+    fi
   fi
   if [ "$(md5sum "$f" | cut -d' ' -f1)" != "$md5" ]; then rm -f "$f"; echo "Checksum mismatch for $pkg - aborting."; exit 1; fi
-  installpkg "$f" | grep -E "^(Installing|Package)" || true
+  if [ "$need" = yes ]; then installpkg "$f" | grep -E "^(Installing|Package)" || true; fi
 done
 </INLINE>
 </FILE>

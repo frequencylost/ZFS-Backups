@@ -388,6 +388,29 @@ test_conflicts_detects_other_sanoid_configs() {
   ok "conflict reported" grep -q "manages 'disk1/ANIME' (overlaps job 'media')" "$SB/out"
 }
 
+test_conflicts_ignore_inactive_leftovers() {
+  add_ds disk1/ANIME; add_ds pool/appdata
+  job media DATASETS=disk1/ANIME DAILY=2
+  job apps DATASETS=pool/appdata DAILY=7
+  mkdir -p "$SB/plugins" "$SB/emhttp/pool_appdata" "$SB/scripts/snap"
+  printf '[disk1/ANIME]\n\tdaily = 1\n' > "$SB/buddy.conf"
+  printf '[pool/appdata]\n\tdaily = 7\n' > "$SB/emhttp/pool_appdata/sanoid.conf"
+  printf '#!/bin/bash\n/usr/local/sbin/sanoid --take-snapshots\n' > "$SB/scripts/snap/script"
+  touch "$SB/plugins/user.scripts.plg"
+  sched() { printf '{"%s": {"script": "%s", "frequency": "%s", "custom": ""}}\n' "$SB/scripts/snap/script" "$SB/scripts/snap/script" "$1" > "$SB/schedule.json"; }
+  cf() { ZFSB_CONFLICT_FILES="" ZFSB_PLUGINS_LOG="$SB/plugins" ZFSB_BUDDY_CONF="$SB/buddy.conf" ZFSB_SANOID_CONF="$SB/none" \
+         ZFSB_SIO_GLOB="$SB/emhttp/*/sanoid.conf" ZFSB_USERSCRIPTS_SCHEDULE="$SB/schedule.json" bash "$ENGINE" conflicts; }
+
+  sched disabled
+  eq "uninstalled BuddyBackup + unscheduled script: no conflicts" "No conflicts found." "$(cf)"
+  touch "$SB/plugins/buddybackup.plg"
+  ok "installed BuddyBackup is reported" has "$(cf)" "manages 'disk1/ANIME'"
+  rm "$SB/plugins/buddybackup.plg"; sched custom
+  ok "scheduled sanoid user script makes its config count" has "$(cf)" "manages 'pool/appdata'"
+  printf '#!/bin/bash\necho hello\n' > "$SB/scripts/snap/script"
+  eq "scheduled script that doesn't run sanoid is ignored" "No conflicts found." "$(cf)"
+}
+
 test_plan_is_read_only() {
   add_ds pool/appdata; add_snap pool/appdata daily $((86400*9))
   job apps DATASETS=pool/appdata DAILY=1 REPL_METHOD=zfs REPL_TARGET=backup/x
@@ -421,6 +444,7 @@ t convert_runs_before_snapshots_in_job     test_convert_runs_before_snapshots_in
 t convert_not_enough_space                 test_convert_not_enough_space
 t cron_generation                          test_cron_generation
 t conflicts_detects_other_sanoid_configs   test_conflicts_detects_other_sanoid_configs
+t conflicts_ignore_inactive_leftovers      test_conflicts_ignore_inactive_leftovers
 t plan_is_read_only                        test_plan_is_read_only
 
 echo

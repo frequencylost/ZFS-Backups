@@ -106,7 +106,7 @@ Uninstalling removes the plugin and its schedules but keeps your job settings an
 ## Development
 
 ```
-bash tests/run-tests.sh      # 105 checks, real sanoid against a fake zfs - needs Linux, bash 5, perl deps
+bash tests/run-tests.sh      # 109 checks, real sanoid against a fake zfs - needs Linux, bash 5, perl deps
 ./build.sh [version]         # builds packages/*.txz and stamps version + MD5 into zfs.backups.plg
 ```
 

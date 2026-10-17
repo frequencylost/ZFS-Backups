@@ -786,6 +786,25 @@ cmd_validate() {
   return $rc
 }
 
+# sanoid configs that something on this server still runs. Like Unraid's own
+# update_cron, a config only counts while its plugin is installed, so files left
+# behind by an uninstalled plugin or an unscheduled script are ignored.
+active_sanoid_configs() {
+  local plugins="${ZFSB_PLUGINS_LOG:-/var/log/plugins}"
+  local schedule="${ZFSB_USERSCRIPTS_SCHEDULE:-/boot/config/plugins/user.scripts/schedule.json}"
+  [[ -f $plugins/buddybackup.plg ]] && echo "${ZFSB_BUDDY_CONF:-/boot/config/plugins/buddybackup/sanoid.conf}"
+  [[ -f $plugins/unRAID6-Sanoid.plg ]] && echo "${ZFSB_SANOID_CONF:-/etc/sanoid/sanoid.conf}"
+  # SpaceInvader One style user scripts generate /usr/local/emhttp/<pool>_<dataset>/sanoid.conf;
+  # those only count while a scheduled user script still runs sanoid
+  if [[ -f $plugins/user.scripts.plg && -f $schedule ]] &&
+     jq -r '.[] | select(.frequency != "disabled") | .script' "$schedule" 2>/dev/null |
+       while IFS= read -r s; do [[ -f $s ]] && grep -q sanoid "$s" && echo hit; done | grep -q hit; then
+    local f
+    for f in ${ZFSB_SIO_GLOB:-/usr/local/emhttp/*/sanoid.conf}; do echo "$f"; done
+  fi
+  return 0
+}
+
 # Other sanoid configs / scripts on this box that manage the same datasets.
 cmd_conflicts() {
   local -A mine=()
@@ -797,7 +816,7 @@ cmd_conflicts() {
   local found=0
   local -a files
   if [[ -n ${ZFSB_CONFLICT_FILES-} ]]; then read -r -a files <<< "$ZFSB_CONFLICT_FILES"
-  else files=(/boot/config/plugins/buddybackup/sanoid.conf /etc/sanoid/sanoid.conf /usr/local/emhttp/*/sanoid.conf); fi
+  else mapfile -t files < <(active_sanoid_configs); fi
   for f in "${files[@]}"; do
     [[ -f $f ]] || continue
     while IFS= read -r sec; do
