@@ -3,14 +3,14 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name      "zfs.backups">
   <!ENTITY author    "FrequencyLost">
-  <!ENTITY version   "2026.10.17a">
+  <!ENTITY version   "2026.10.17b">
   <!ENTITY launch    "Settings/ZFSBackups">
   <!ENTITY gitURL    "https://raw.githubusercontent.com/frequencylost/ZFS-Backups/main">
   <!ENTITY pluginURL "&gitURL;/&name;.plg">
   <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
   <!ENTITY pkgPath   "/boot/config/plugins/&name;">
   <!ENTITY pkgName   "&name;-&version;-noarch-1.txz">
-  <!ENTITY pkgMD5    "750943b45ab13dc2b6f68c19b43c587c">
+  <!ENTITY pkgMD5    "fc8808db75fdeea8914cdf393889480d">
 ]>
 
 <PLUGIN name="&name;"
@@ -24,6 +24,12 @@
 
 <CHANGES>
 ##ZFS Backups
+
+###2026.10.17b
+- Dataset Conversion handles one folder at a time: only that folder's containers/VMs are stopped, and they are started again before the next folder
+- New per-folder time limit (default 20 min): a copy + verify that takes longer is stopped and the folder is rolled back
+- Folders in use are skipped when stopping containers/VMs is turned off, and when a container fails to stop
+- A failed conversion during a snapshot job now marks the job as a warning (snapshots still ran) instead of failed
 
 ###2026.10.17a
 - Conflict check only reports tools that are still active: configs left behind by an uninstalled plugin or an unscheduled User Script are ignored

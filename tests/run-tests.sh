@@ -356,6 +356,85 @@ test_convert_not_enough_space() {
   zfsb convert > "$SB/out" 2>&1
   ok "refuses when space is short" grep -q "not enough space" "$SB/out"
   ok "folder untouched" test -f "$SB/mnt/pool/appdata/newapp/db.sqlite"
+  ok "container not stopped for a folder that is skipped" hasnt "$(calls)" "docker stop"
+}
+
+two_app_fixture() {
+  add_ds pool/appdata
+  mkdir -p "$SB/mnt/pool/appdata/appA" "$SB/mnt/pool/appdata/appB"
+  echo a > "$SB/mnt/pool/appdata/appA/a.conf"; echo b > "$SB/mnt/pool/appdata/appB/b.conf"
+  printf 'ca\ta\t1\t%s\ncb\tb\t1\t%s\n' "$SB/mnt/pool/appdata/appA" "$SB/mnt/pool/appdata/appB/config" > "$ZFSMOCK/containers"
+  printf 'ENABLED="yes"\nPARENTS="pool/appdata"\nSTOP_CONTAINERS="yes"\n' > "$ZFSB_CFG_DIR/convert.cfg"
+}
+line_of() { grep -nF -- "$1" "$ZFSMOCK/calls.log" | head -1 | cut -d: -f1; }
+
+test_convert_one_folder_at_a_time() {
+  two_app_fixture
+  zfsb convert > "$SB/out" 2>&1
+  eq "convert exits 0" 0 $?
+  local sa sta sb stb
+  sa=$(line_of "docker stop ca"); sta=$(line_of "docker start a"); sb=$(line_of "docker stop cb"); stb=$(line_of "docker start b")
+  ok "a stopped, then restarted before b is stopped" test -n "$sa" -a -n "$sta" -a -n "$sb" -a -n "$stb" -a "$sa" -lt "$sta" -a "$sta" -lt "$sb" -a "$sb" -lt "$stb"
+  ok "appA converted" has "$(cut -f1 "$ZFSMOCK/datasets")" "pool/appdata/appA"
+  ok "appB converted" has "$(cut -f1 "$ZFSMOCK/datasets")" "pool/appdata/appB"
+  ok "both containers running at the end" bash -c "! awk -F'\t' '\$3==0' '$ZFSMOCK/containers' | grep -q ."
+}
+
+test_convert_timeout_rolls_back() {
+  two_app_fixture
+  # a copy that hangs: exec so the timeout's signal reaches the sleeping process directly
+  mkdir -p "$SB/bin"; printf '#!/bin/bash\nexec sleep 60\n' > "$SB/bin/rsync"; chmod +x "$SB/bin/rsync"
+  local t0=$SECONDS
+  PATH="$SB/bin:$PATH" ZFSB_FOLDER_TIMEOUT_SECS=2 bash "$ENGINE" convert > "$SB/out" 2>&1
+  local rc=$? took=$(( SECONDS - t0 ))
+  eq "reports failure" 1 $rc
+  ok "gave up quickly instead of hanging (took ${took}s)" test $took -lt 20
+  ok "timeout reported" grep -q "did not finish within" "$SB/out"
+  ok "appA folder restored" test -f "$SB/mnt/pool/appdata/appA/a.conf"
+  ok "appB folder restored" test -f "$SB/mnt/pool/appdata/appB/b.conf"
+  ok "no temp folders left" bash -c "! ls -d '$SB'/mnt/pool/appdata/*_zfsb_tmp 2>/dev/null | grep -q ."
+  ok "half-made datasets destroyed" hasnt "$(cut -f1 "$ZFSMOCK/datasets")" "pool/appdata/app"
+  ok "containers restarted" bash -c "grep -q 'docker start a' '$ZFSMOCK/calls.log' && grep -q 'docker start b' '$ZFSMOCK/calls.log'"
+}
+
+test_convert_timeout_setting_in_minutes() {
+  convert_fixture
+  echo 'FOLDER_TIMEOUT="7"' >> "$ZFSB_CFG_DIR/convert.cfg"
+  zfsb convert > "$SB/out" 2>&1
+  ok "limit from config is used" grep -q "time limit 7 min" "$SB/out"
+  printf 'ENABLED="yes"\nPARENTS="pool/appdata"\nFOLDER_TIMEOUT="0"\n' > "$ZFSB_CFG_DIR/convert.cfg"
+  mkdir -p "$SB/mnt/pool/appdata/another"; echo x > "$SB/mnt/pool/appdata/another/f"
+  zfsb convert > "$SB/out" 2>&1
+  ok "0 means no limit" bash -c "grep -q 'converting.*another' '$SB/out' && ! grep -q 'time limit' '$SB/out'"
+}
+
+test_convert_skips_in_use_when_stopping_disabled() {
+  convert_fixture
+  sed -i 's/^STOP_CONTAINERS=.*/STOP_CONTAINERS="no"/' "$ZFSB_CFG_DIR/convert.cfg"
+  zfsb convert > "$SB/out" 2>&1
+  ok "folder in use is skipped" grep -q "skipping 'newapp': in use by container" "$SB/out"
+  ok "container left running" hasnt "$(calls)" "docker stop"
+  ok "not converted" hasnt "$(cut -f1 "$ZFSMOCK/datasets")" "pool/appdata/newapp"
+}
+
+test_convert_stop_failure_skips_folder() {
+  convert_fixture
+  ZFSMOCK_DOCKER_FAIL="stop c1" bash "$ENGINE" convert > "$SB/out" 2>&1
+  ok "error reported" grep -q "could not stop container newapp - folder skipped" "$SB/out"
+  ok "not converted while possibly in use" hasnt "$(cut -f1 "$ZFSMOCK/datasets")" "pool/appdata/newapp"
+  ok "folder untouched" test -f "$SB/mnt/pool/appdata/newapp/db.sqlite"
+}
+
+test_convert_failure_in_job_is_warning() {
+  convert_fixture
+  mkdir -p "$SB/bin"; printf '#!/bin/bash\nexit 23\n' > "$SB/bin/rsync"; chmod +x "$SB/bin/rsync"
+  job apps DATASETS=pool/appdata RECURSIVE=yes DAILY=7
+  PATH="$SB/bin:$PATH" bash "$ENGINE" run apps > "$SB/out" 2>&1
+  eq "job still succeeds overall" 0 $?
+  eq "status: warning" warning "$(jq -r .state "$ZFSB_STATE_DIR/status/apps.json")"
+  ok "summary counts the warnings" bash -c "jq -r .summary '$ZFSB_STATE_DIR/status/apps.json' | grep -q '2 warning(s)'"
+  ok "warning notification names the failed conversion" bash -c "grep '^notify' '$ZFSMOCK/calls.log' | grep -- '-i warning' | grep -q 'dataset conversion: newapp: copy failed'"
+  ok "snapshots still taken" test "$(snaps_of pool/appdata | grep -c .)" -eq 1
 }
 
 # ---- scheduling / misc ----
@@ -442,6 +521,12 @@ t convert_dry_run                          test_convert_dry_run
 t convert_rolls_back_on_failure            test_convert_rolls_back_on_failure
 t convert_runs_before_snapshots_in_job     test_convert_runs_before_snapshots_in_job
 t convert_not_enough_space                 test_convert_not_enough_space
+t convert_one_folder_at_a_time             test_convert_one_folder_at_a_time
+t convert_timeout_rolls_back               test_convert_timeout_rolls_back
+t convert_timeout_setting_in_minutes       test_convert_timeout_setting_in_minutes
+t convert_skips_in_use_when_stopping_off   test_convert_skips_in_use_when_stopping_disabled
+t convert_stop_failure_skips_folder        test_convert_stop_failure_skips_folder
+t convert_failure_in_job_is_warning        test_convert_failure_in_job_is_warning
 t cron_generation                          test_cron_generation
 t conflicts_detects_other_sanoid_configs   test_conflicts_detects_other_sanoid_configs
 t conflicts_ignore_inactive_leftovers      test_conflicts_ignore_inactive_leftovers

@@ -457,16 +457,6 @@ real_location() {
   echo "$p"
 }
 
-# the candidate folder (if any) a path falls under: prints "<parent-mountpoint>/<child>"
-candidate_for_path() { # <path> <mountpoint> <candidate-names...>
-  local p="$1" mp="$2"; shift 2
-  local c
-  for c in "$@"; do
-    [[ $p == "$mp/$c" || $p == "$mp/$c"/* ]] && { echo "$mp/$c"; return 0; }
-  done
-  return 1
-}
-
 convert_restart_all() {
   local c v
   for c in "${STOPPED_CONTAINERS[@]}"; do
@@ -478,8 +468,75 @@ convert_restart_all() {
   STOPPED_CONTAINERS=(); STOPPED_VMS=()
 }
 
-files_signature() { # "<file count> <total bytes>"
-  find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{n++; s+=$1} END {printf "%d %d\n", n, s}'
+files_signature() { # <dir> [time-limit-secs] -> "<file count> <total bytes>"; returns 124 on timeout
+  local -a tmo=(); [[ ${2:-0} -gt 0 ]] && tmo=(timeout "$2")
+  "${tmo[@]}" find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{n++; s+=$1} END {printf "%d %d\n", n, s}'
+  [[ ${PIPESTATUS[0]} -eq 124 ]] && return 124
+  return 0
+}
+
+# Running containers' bind mounts and running VMs' vdisks, resolved to real paths.
+# Fills CT_MOUNTS ("id|name|path") and VM_DISKS ("vm|path").
+collect_folder_users() {
+  CT_MOUNTS=(); VM_DISKS=()
+  local cid cname src vm disk
+  if command -v docker >/dev/null; then
+    while IFS= read -r cid; do
+      [[ -z $cid ]] && continue
+      cname=$(docker inspect --format '{{.Name}}' "$cid" | cut -c2-)
+      while IFS= read -r src; do
+        [[ -n $src ]] && CT_MOUNTS+=("$cid|$cname|$(real_location "$src")")
+      done < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$cid")
+    done < <(docker ps -q)
+  fi
+  if command -v virsh >/dev/null; then
+    while IFS= read -r vm; do
+      [[ -z $vm ]] && continue
+      while IFS= read -r disk; do
+        [[ -n $disk ]] && VM_DISKS+=("$vm|$(real_location "$disk")")
+      done < <(virsh domblklist "$vm" --details 2>/dev/null | awk '$1=="file" && $2=="disk" {print $4}')
+    done < <(virsh list --name --state-running)
+  fi
+}
+
+# Copy one folder into a new dataset at the same path, verify, and either remove
+# the original or roll everything back. Copy + verify must finish within <limit>
+# seconds (0 = no limit). Returns 0 on success.
+convert_folder() { # <name> <src> <tmp> <dataset> <dataset-mountpoint> <limit-secs>
+  local name="$1" src="$2" tmp="$3" ds="$4" dest="$5" limit="$6" t0=$SECONDS rc why="" left a b
+  local -a tmo=(); (( limit > 0 )) && tmo=(timeout --kill-after=30 "$limit")
+  local mins=$(( (limit + 59) / 60 ))
+  mv "$src" "$tmp" || { err "$name: could not rename the folder"; return 1; }
+  if ! zfs create "$ds"; then
+    err "$name: could not create dataset $ds - folder restored"; mv "$tmp" "$src"; return 1
+  fi
+  "${tmo[@]}" rsync -aHAX --numeric-ids "$tmp/" "$dest/" 2>&1 | sed 's/^/    /'
+  rc=${PIPESTATUS[0]}
+  if (( rc == 124 || rc == 137 )); then why="copy did not finish within $mins min"
+  elif (( rc != 0 )); then why="copy failed (rsync exit code $rc)"
+  else
+    left=0
+    if (( limit > 0 )); then left=$(( limit - (SECONDS - t0) )); (( left < 1 )) && why="did not finish within $mins min"; fi
+    if [[ -z $why ]]; then
+      if ! a=$(files_signature "$tmp" "$left"); then why="verification did not finish within $mins min"
+      else
+        (( limit > 0 )) && { left=$(( limit - (SECONDS - t0) )); (( left < 1 )) && left=1; }
+        if ! b=$(files_signature "$dest" "$left"); then why="verification did not finish within $mins min"
+        elif [[ $a != "$b" ]]; then why="verification failed (original: ${a% *} files/${a#* } bytes, copy: ${b% *} files/${b#* } bytes)"
+        fi
+      fi
+    fi
+  fi
+  if [[ -z $why ]]; then
+    rm -rf "$tmp"
+    log "  converted $name (${a% *} files verified in $(( SECONDS - t0 ))s)"
+    CONVERTED+=("$ds")
+    return 0
+  fi
+  # roll back: drop the dataset we just created and put the folder back
+  err "$name: $why - rolled back, the folder is unchanged"
+  zfs destroy "$ds" && mv "$tmp" "$src" || err "ROLLBACK FAILED for $name: the original data is in $tmp"
+  return 1
 }
 
 run_convert() { # [parents...]  (defaults to every configured parent)
@@ -490,6 +547,9 @@ run_convert() { # [parents...]  (defaults to every configured parent)
   local stop_containers=${C[STOP_CONTAINERS]:-yes} stop_vms=${C[STOP_VMS]:-no}
   local vm_wait=${C[VM_WAIT]:-90} replace_spaces=${C[REPLACE_SPACES]:-no}
   local dry=$DRY_RUN; [[ ${C[DRY_RUN]-no} == yes ]] && dry=yes
+  # per-folder time limit for copy + verify (minutes; 0 = none)
+  local limit=${C[FOLDER_TIMEOUT]:-20}; is_uint "$limit" || limit=20
+  limit=$(( limit * 60 )); [[ -n ${ZFSB_FOLDER_TIMEOUT_SECS-} ]] && limit=$ZFSB_FOLDER_TIMEOUT_SECS
   local rc=0 parent mp entry name newname
 
   for parent in "${parents[@]}"; do
@@ -515,79 +575,78 @@ run_convert() { # [parents...]  (defaults to every configured parent)
     [[ ${#cands[@]} -eq 0 ]] && { log "  nothing to convert"; continue; }
     log "  folders to convert: ${cands[*]}"
 
-    # stop containers / VMs whose data lives in those folders; always restart them,
-    # even if this run is interrupted
+    collect_folder_users
+
+    # One folder at a time: check space, stop only what uses this folder, convert,
+    # start it again, then move on - so each container is down only for its own copy.
+    # Whatever was stopped is always restarted, even if the run is interrupted.
     trap convert_restart_all EXIT
     trap 'exit 130' INT TERM
-    if [[ $stop_containers == yes ]] && command -v docker >/dev/null; then
-      local cid cname src hit
-      while IFS= read -r cid; do
-        [[ -z $cid ]] && continue
-        cname=$(docker inspect --format '{{.Name}}' "$cid" | cut -c2-)
-        hit=""
-        while IFS= read -r src; do
-          [[ -z $src ]] && continue
-          src=$(real_location "$src")
-          hit=$(candidate_for_path "$src" "$mp" "${cands[@]}") && break
-        done < <(docker inspect --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{"\n"}}{{end}}{{end}}' "$cid")
-        [[ -z $hit ]] && continue
-        if [[ $dry == yes ]]; then log "  [dry run] would stop container $cname (uses $hit)"; continue; fi
-        log "  stopping container $cname (uses $hit)"
-        docker stop "$cid" >/dev/null && STOPPED_CONTAINERS+=("$cname") || { err "could not stop $cname"; rc=1; }
-      done < <(docker ps -q)
-    fi
-    if [[ $stop_vms == yes ]] && command -v virsh >/dev/null; then
-      local vm disk hit
-      while IFS= read -r vm; do
-        [[ -z $vm ]] && continue
-        hit=""
-        while IFS= read -r disk; do
-          disk=$(real_location "$disk")
-          hit=$(candidate_for_path "$disk" "$mp" "${cands[@]}") && break
-        done < <(virsh domblklist "$vm" --details 2>/dev/null | awk '$1=="file" && $2=="disk" {print $4}')
-        [[ -z $hit ]] && continue
-        if [[ $dry == yes ]]; then log "  [dry run] would shut down VM $vm (uses $hit)"; continue; fi
-        log "  shutting down VM $vm (uses $hit)"
-        virsh shutdown "$vm" >/dev/null
-        local t0=$SECONDS
-        while virsh domstate "$vm" 2>/dev/null | grep -q running; do
-          (( SECONDS - t0 >= vm_wait )) && { warn "VM $vm did not shut down in ${vm_wait}s - forcing off"; virsh destroy "$vm" >/dev/null; break; }
-          sleep 3
-        done
-        STOPPED_VMS+=("$vm")
-      done < <(virsh list --name --state-running)
-    fi
-
-    # convert
-    local i
+    local i m v cid cname p vm
     for i in "${!cands[@]}"; do
       name=${cands[$i]}; newname=${targets[$i]}
       local src="$mp/$name" tmp="$mp/$newname$CONVERT_SUFFIX" ds="$parent/$newname"
+
       local size avail
       size=$(du -sb "$src" | cut -f1)
       avail=$(zfs get -H -p -o value available "$parent")
       if (( avail < size + size / 10 )); then
-        err "not enough space to convert $src ($(( size / 1048576 )) MiB needed + 10%)"; rc=1; continue
+        err "$name: not enough space to convert ($(( size / 1048576 )) MiB needed + 10%)"; rc=1; continue
       fi
-      if [[ $dry == yes ]]; then log "  [dry run] would convert $src -> dataset $ds"; continue; fi
-      log "  converting $src -> $ds"
-      mv "$src" "$tmp" || { err "could not rename $src"; rc=1; continue; }
-      if ! zfs create "$ds"; then
-        err "could not create dataset $ds - restoring folder"; mv "$tmp" "$src"; rc=1; continue
+
+      # who uses this folder?
+      local -A f_cts=() f_vms=()
+      for m in "${CT_MOUNTS[@]}"; do
+        IFS='|' read -r cid cname p <<< "$m"
+        [[ $p == "$src" || $p == "$src"/* ]] && f_cts[$cid]=$cname
+      done
+      for v in "${VM_DISKS[@]}"; do
+        IFS='|' read -r vm p <<< "$v"
+        [[ $p == "$src" || $p == "$src"/* ]] && f_vms[$vm]=1
+      done
+      if [[ ${#f_cts[@]} -gt 0 && $stop_containers != yes ]]; then
+        warn "skipping '$name': in use by container(s) ${f_cts[*]} and stopping containers is turned off"; continue
       fi
-      if rsync -aHAX --numeric-ids "$tmp/" "$mp/$newname/" 2>&1 | sed 's/^/    /' \
-         && [[ "$(files_signature "$tmp")" == "$(files_signature "$mp/$newname")" ]]; then
-        rm -rf "$tmp"
-        log "  converted $name ($(files_signature "$mp/$newname" | awk '{print $1}') files verified)"
-        CONVERTED+=("$ds")
+      if [[ ${#f_vms[@]} -gt 0 && $stop_vms != yes ]]; then
+        warn "skipping '$name': in use by VM(s) ${!f_vms[*]} and stopping VMs is turned off"; continue
+      fi
+
+      if [[ $dry == yes ]]; then
+        for cid in "${!f_cts[@]}"; do log "  [dry run] would stop container ${f_cts[$cid]} while $name is copied"; done
+        for vm in "${!f_vms[@]}"; do log "  [dry run] would shut down VM $vm while $name is copied"; done
+        log "  [dry run] would convert $src -> dataset $ds"
+        continue
+      fi
+
+      # stop this folder's users; never copy a folder something still has open
+      local stop_failed=0
+      for cid in "${!f_cts[@]}"; do
+        log "  stopping container ${f_cts[$cid]} (uses $name)"
+        if docker stop "$cid" >/dev/null; then STOPPED_CONTAINERS+=("${f_cts[$cid]}")
+        else err "$name: could not stop container ${f_cts[$cid]} - folder skipped"; stop_failed=1; break; fi
+      done
+      if [[ $stop_failed -eq 0 ]]; then
+        for vm in "${!f_vms[@]}"; do
+          log "  shutting down VM $vm (uses $name)"
+          virsh shutdown "$vm" >/dev/null
+          local t0=$SECONDS
+          while virsh domstate "$vm" 2>/dev/null | grep -q running; do
+            (( SECONDS - t0 >= vm_wait )) && { warn "VM $vm did not shut down in ${vm_wait}s - forcing off"; virsh destroy "$vm" >/dev/null; break; }
+            sleep 3
+          done
+          STOPPED_VMS+=("$vm")
+        done
+      fi
+
+      if [[ $stop_failed -eq 0 ]]; then
+        log "  converting $src -> $ds$( (( limit > 0 )) && echo " (time limit $(( (limit + 59) / 60 )) min)")"
+        convert_folder "$name" "$src" "$tmp" "$ds" "$mp/$newname" "$limit" || rc=1
       else
-        # roll back: drop the dataset we just created and put the folder back
-        err "copy/verify failed for $name - rolling back"
-        zfs destroy "$ds" && mv "$tmp" "$src" || err "ROLLBACK FAILED for $name: original data is in $tmp"
         rc=1
       fi
+      convert_restart_all
+      unset f_cts f_vms
     done
-    convert_restart_all
     trap - EXIT INT TERM
   done
   return $rc
@@ -637,7 +696,13 @@ run_job() { # <id>
         [[ $p == "$ds" || ( $JOB_RECURSIVE != no && $p == "$ds"/* ) ]] && { mine+=("$p"); break; }
       done
     done
-    [[ ${#mine[@]} -gt 0 ]] && { run_convert "${mine[@]}" || true; }
+    if [[ ${#mine[@]} -gt 0 ]]; then
+      local nerr=${#ERRORS[@]} e
+      run_convert "${mine[@]}" || true
+      # a failed conversion is rolled back and doesn't stop the snapshots: report it as a warning on the job
+      for e in "${ERRORS[@]:nerr}"; do WARNINGS+=("dataset conversion: $e"); done
+      ERRORS=("${ERRORS[@]:0:nerr}")
+    fi
   fi
 
   # 2. wake the array disks this job needs, all at once
@@ -685,7 +750,7 @@ run_job() { # <id>
     return 1
   elif [[ ${#WARNINGS[@]} -gt 0 ]]; then
     log "===== Job '$JOB_NAME' finished with warnings after ${secs}s ($summary) ====="
-    write_status warning "$summary - ${WARNINGS[0]}"
+    write_status warning "$summary - ${#WARNINGS[@]} warning(s): ${WARNINGS[0]}"
     notify warning "ZFS Backups: $JOB_NAME finished with warnings$tag" "$summary. ${WARNINGS[*]}"
   else
     log "===== Job '$JOB_NAME' finished OK after ${secs}s ($summary) ====="

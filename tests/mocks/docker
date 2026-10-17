@@ -2,6 +2,7 @@
 # Fake docker. $ZFSMOCK/containers: id<TAB>name<TAB>running(0/1)<TAB>bind-source[,bind-source...]
 : "${ZFSMOCK:?}"; C="$ZFSMOCK/containers"; touch "$C"
 echo "docker $*" >> "$ZFSMOCK/calls.log"
+[[ -n ${ZFSMOCK_DOCKER_FAIL:-} && "$*" == *"$ZFSMOCK_DOCKER_FAIL"* ]] && { echo "mock docker failure: $*" >&2; exit 1; }
 row() { awk -F'\t' -v k="$1" '$1==k || $2==k' "$C"; }
 set_running() { awk -F'\t' -v OFS='\t' -v k="$1" -v r="$2" '($1==k||$2==k){$3=r} 1' "$C" > "$C.tmp" && mv "$C.tmp" "$C"; }
 case $1 in

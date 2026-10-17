@@ -5,9 +5,9 @@ Markdown="false"
 <div class="zfsb" id="zb-convert">
   <p class="muted">Watches parent datasets such as <code>appdata</code> or <code>domains</code> and turns any plain
   folder inside them into its own child dataset, so every container or VM gets its own snapshots and can be rolled
-  back on its own. Containers and VMs using a folder are stopped while it is copied, and started again afterwards.
-  Each copy is verified (file count and total size) before the original is removed; if anything fails, the folder
-  is put back exactly as it was.</p>
+  back on its own. Folders are converted one at a time: only the containers and VMs using that folder are stopped,
+  and they are started again as soon as it is done. Each copy is verified (file count and total size) before the
+  original is removed; if anything fails or takes too long, the folder is put back exactly as it was.</p>
 
   <form class="panel" id="zb-cv" onsubmit="return false">
     <div class="grid">
@@ -47,7 +47,7 @@ Markdown="false"
       <label>Stop Docker containers</label>
       <select name="STOP_CONTAINERS">
         <option value="yes">Yes — stop only containers whose data is in a folder being converted</option>
-        <option value="no">No — skip folders in use (not recommended)</option>
+        <option value="no">No — skip folders a running container uses (they stay folders)</option>
       </select>
 
       <label>Stop VMs</label>
@@ -58,6 +58,14 @@ Markdown="false"
         </select>
         force off after <input type="number" name="VM_WAIT" min="10" max="3600" style="width: 70px"> s
       </div>
+
+      <label>Time limit per folder</label>
+      <div>
+        <input type="number" name="FOLDER_TIMEOUT" min="0" max="9999" style="width: 70px"> minutes
+        <span class="muted">(0 = no limit)</span>
+      </div>
+      <div class="hint muted">If copying and verifying one folder takes longer than this, the copy is stopped and the
+        folder is put back exactly as it was. Its container is started again, and the next folder is tried.</div>
 
       <label>Folder names with spaces</label>
       <select name="REPLACE_SPACES">
@@ -91,7 +99,7 @@ Markdown="false"
 (function () {
   var watch = {};
   var FIELDS = ['ENABLED', 'MODE', 'SCHEDULE', 'SCHEDULE_DOW', 'SCHEDULE_TIME', 'SCHEDULE_CRON', 'STOP_CONTAINERS',
-                'STOP_VMS', 'VM_WAIT', 'REPLACE_SPACES', 'DRY_RUN', 'NOTIFY'];
+                'STOP_VMS', 'VM_WAIT', 'FOLDER_TIMEOUT', 'REPLACE_SPACES', 'DRY_RUN', 'NOTIFY'];
 
   function msg(cls, html) { $('#zb-cv-msg').removeClass('hidden bad good').addClass(cls).html(html); }
 

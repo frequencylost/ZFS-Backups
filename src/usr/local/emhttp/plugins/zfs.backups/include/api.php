@@ -56,6 +56,7 @@ $CONVERT_FIELDS = [
   'STOP_CONTAINERS' => [['yes', 'no'], 'yes'],
   'STOP_VMS'        => [['yes', 'no'], 'no'],
   'VM_WAIT'         => ['/^\d{1,4}$/', '90'],
+  'FOLDER_TIMEOUT'  => ['/^\d{1,4}$/', '20'],
   'REPLACE_SPACES'  => [['yes', 'no'], 'no'],
   'DRY_RUN'         => [['yes', 'no'], 'no'],
   'NOTIFY'          => [['all', 'error', 'none'], 'all'],

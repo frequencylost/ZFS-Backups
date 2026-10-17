@@ -25,8 +25,9 @@ It replaces this common combination:
 - **Replication** after snapshotting, either `zfs send` via syncoid (to another pool, or another server over SSH) or
   rsync (dated hard-linked copies, or a mirror) for non-ZFS destinations. Replication runs *before* pruning, and
   syncoid keeps a bookmark, so an incremental base is never lost even with 1-day retention.
-- **Folder → dataset conversion** for `appdata`, `domains` and so on. Only the containers or VMs using a folder are
-  stopped. Copies are verified, and anything that fails is rolled back.
+- **Folder → dataset conversion** for `appdata`, `domains` and so on. Folders are converted one at a time, and only
+  the containers or VMs using that folder are stopped, then started again straight away. Copies are verified, and a
+  copy that fails or runs past the time limit (20 min by default) is rolled back.
 - **Array disk wake-up.** A job spins up only the array disks it needs, all at once, through Unraid's `emcmd`
   (the same thing as the GUI's spin-up button). Disks are never written to just to wake them.
 - **Safe by design.** It refuses to run when two jobs would manage the same dataset, warns when another tool
@@ -106,7 +107,7 @@ Uninstalling removes the plugin and its schedules but keeps your job settings an
 ## Development
 
 ```
-bash tests/run-tests.sh      # 109 checks, real sanoid against a fake zfs - needs Linux, bash 5, perl deps
+bash tests/run-tests.sh      # 136 checks, real sanoid against a fake zfs - needs Linux, bash 5, perl deps
 ./build.sh [version]         # builds packages/*.txz and stamps version + MD5 into zfs.backups.plg
 ```
 
